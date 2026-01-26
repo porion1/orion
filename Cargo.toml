@@ -1,0 +1,26 @@
+[package]
+name = "orion"
+version = "0.1.0"
+edition = "2021"
+authors = ["Rehan"]
+description = "Orion – High-performance task orchestration engine in Rust"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["full", "time"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+toml = "0.7"
+sled = "0.34"
+clap = { version = "4.2", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+ring = "0.17"
+
+# Scheduler dependencies
+chrono = "0.4"
+cron = "0.12"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+metrics = "0.21"
+metrics-exporter-prometheus = "0.12"
