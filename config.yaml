@@ -1,3 +1,6 @@
 scheduler_tick_secs: 1
 max_concurrent_tasks: 100
 logging_level: "info"
+persistence_path: "./orion-data"
+metrics_port: 9000
+metrics_enabled: true

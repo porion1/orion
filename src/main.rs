@@ -27,7 +27,7 @@ async fn main() {
     let engine_scheduler = engine.scheduler.clone();
     tokio::spawn(async move {
         // Give the scheduler a moment to start
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
 
         // Schedule a one-shot task that runs after 5 seconds
         println!("📅 Scheduling one-shot task (runs in 5 seconds)...");
@@ -43,7 +43,6 @@ async fn main() {
         }
 
         // Schedule a recurring task that runs every 10 seconds
-        // Using a simpler cron expression for testing
         println!("📅 Scheduling recurring task (every 10 seconds)...");
         match Task::new_recurring(
             "Health Check",

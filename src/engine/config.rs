@@ -6,6 +6,9 @@ pub struct EngineConfig {
     pub scheduler_tick_secs: u64,
     pub max_concurrent_tasks: usize,
     pub logging_level: Option<String>,
+    pub persistence_path: Option<String>,
+    pub metrics_port: u16,
+    pub metrics_enabled: bool,
 }
 
 impl EngineConfig {
@@ -26,6 +29,17 @@ impl EngineConfig {
             scheduler_tick_secs: 1,
             max_concurrent_tasks: 100,
             logging_level: Some("info".to_string()),
+            persistence_path: Some("./orion-data".to_string()),
+            metrics_port: 9000,
+            metrics_enabled: true,
         }
+    }
+
+    pub fn get_persistence_path(&self) -> &str {
+        self.persistence_path.as_deref().unwrap_or("./orion-data")
+    }
+
+    pub fn should_enable_metrics(&self) -> bool {
+        self.metrics_enabled
     }
 }
