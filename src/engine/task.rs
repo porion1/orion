@@ -4,13 +4,16 @@ use uuid::Uuid;
 use std::str::FromStr;
 use cron::Schedule;
 use chrono::Utc;
+use std::collections::HashMap;
 
+/// Task types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TaskType {
     OneShot,
     Recurring { cron_expr: String },
 }
 
+/// Task execution status
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TaskStatus {
     Pending,
@@ -20,6 +23,7 @@ pub enum TaskStatus {
     Cancelled,
 }
 
+/// Main Task struct
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: Uuid,
@@ -35,7 +39,7 @@ pub struct Task {
     pub updated_at: SystemTime,
     pub retry_count: u32,
     pub max_retries: u32,
-    pub metadata: Option<std::collections::HashMap<String, String>>,
+    pub metadata: Option<HashMap<String, String>>,
 }
 
 mod system_time_serde {
@@ -60,7 +64,12 @@ mod system_time_serde {
 }
 
 impl Task {
-    pub fn new_one_shot(name: &str, delay: Duration, payload: Option<serde_json::Value>) -> Self {
+    /// Create a one-shot task
+    pub fn new_one_shot(
+        name: &str,
+        delay: Duration,
+        payload: Option<serde_json::Value>,
+    ) -> Self {
         let now = SystemTime::now();
         Self {
             id: Uuid::new_v4(),
@@ -77,20 +86,23 @@ impl Task {
         }
     }
 
-    pub fn new_recurring(name: &str, cron_expr: &str, payload: Option<serde_json::Value>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    /// Create a recurring task from a cron expression
+    pub fn new_recurring(
+        name: &str,
+        cron_expr: &str,
+        payload: Option<serde_json::Value>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let schedule = Schedule::from_str(cron_expr)
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         let now = SystemTime::now();
 
+        // Find the next occurrence
         let next = schedule.upcoming(Utc)
-            .find(|dt| {
-                let duration = dt.signed_duration_since(Utc::now());
-                duration.num_seconds() >= 1
-            })
+            .find(|dt| dt.signed_duration_since(Utc::now()).num_seconds() >= 1)
             .ok_or_else(|| Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "No suitable upcoming execution time found"
+                "No upcoming execution time found",
             )))?;
 
         let duration = next.signed_duration_since(Utc::now());
@@ -112,6 +124,7 @@ impl Task {
         })
     }
 
+    /// Generate the next occurrence for a recurring task
     pub fn create_next_occurrence(&self) -> Option<Self> {
         match &self.task_type {
             TaskType::OneShot => None,
@@ -120,23 +133,20 @@ impl Task {
                 let now = SystemTime::now();
 
                 let next = schedule.upcoming(Utc)
-                    .find(|dt| {
-                        let duration = dt.signed_duration_since(Utc::now());
-                        duration.num_seconds() >= 1
-                    })?;
+                    .find(|dt| dt.signed_duration_since(Utc::now()).num_seconds() >= 1)?;
 
                 let duration = next.signed_duration_since(Utc::now());
                 let scheduled_at = now.checked_add(Duration::from_secs(duration.num_seconds().max(1) as u64))
                     .unwrap_or(now);
 
                 Some(Self {
-                    id: self.id,
+                    id: Uuid::new_v4(), // ✅ New UUID for each occurrence
                     name: self.name.clone(),
                     task_type: TaskType::Recurring { cron_expr: cron_expr.clone() },
                     scheduled_at,
                     payload: self.payload.clone(),
                     status: TaskStatus::Pending,
-                    created_at: self.created_at,
+                    created_at: now,
                     updated_at: now,
                     retry_count: 0,
                     max_retries: self.max_retries,
@@ -146,18 +156,34 @@ impl Task {
         }
     }
 
+    /// Update the task status
     pub fn update_status(&mut self, status: TaskStatus) {
         self.status = status;
         self.updated_at = SystemTime::now();
     }
 
+    /// Check if task should retry
     pub fn should_retry(&self) -> bool {
         matches!(self.status, TaskStatus::Failed(_)) &&
             self.retry_count < self.max_retries
     }
 
+    /// Increment retry count
     pub fn increment_retry(&mut self) {
         self.retry_count += 1;
         self.updated_at = SystemTime::now();
+    }
+}
+
+/// Optional conversion: Task → QueueTask
+impl From<&Task> for crate::queue::QueueTask {
+    fn from(task: &Task) -> Self {
+        crate::queue::QueueTask {
+            id: task.id,
+            name: task.name.clone(),
+            scheduled_at: task.scheduled_at,
+            priority: crate::queue::TaskPriority::Medium,
+            payload: task.payload.clone(), // Option<Value>
+        }
     }
 }

@@ -1,15 +1,15 @@
-use orion::engine::{Engine, EngineConfig, Task};
+use orion::engine::{Engine, EngineConfig, Task, QueueTask, TaskPriority};
 use tracing_subscriber;
 use std::process;
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing
+    // Initialize tracing/logging
     tracing_subscriber::fmt::init();
     println!("🚀 Starting Orion with Enhanced Scheduler...");
 
-    // Load configuration from YAML or use defaults
+    // Load configuration from YAML or fallback to defaults
     let config = match EngineConfig::from_yaml("config.yaml") {
         Ok(cfg) => cfg,
         Err(err) => {
@@ -23,54 +23,59 @@ async fn main() {
     // Initialize the Engine
     let mut engine = Engine::new(config);
 
-    // Schedule some example tasks
-    let engine_scheduler = engine.scheduler.clone();
-    tokio::spawn(async move {
-        // Give the scheduler a moment to start
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        // Schedule a one-shot task that runs after 5 seconds
-        println!("📅 Scheduling one-shot task (runs in 5 seconds)...");
-        let task1 = Task::new_one_shot(
-            "Process Data",
-            Duration::from_secs(5),
-            Some(serde_json::json!({"action": "process", "data": "sample"})),
-        );
-
-        match engine_scheduler.schedule(task1).await {
-            Ok(id) => println!("✅ One-shot task scheduled with ID: {}", id),
-            Err(e) => eprintln!("❌ Failed to schedule task: {}", e),
+    // Helper to convert Task -> QueueTask
+    fn to_queue_task(task: Task, priority: TaskPriority) -> QueueTask {
+        QueueTask {
+            id: task.id,
+            name: task.name,
+            scheduled_at: task.scheduled_at,
+            priority,
+            payload: task.payload.clone(),
         }
+    }
 
-        // Schedule a recurring task that runs every 10 seconds
-        println!("📅 Scheduling recurring task (every 10 seconds)...");
-        match Task::new_recurring(
-            "Health Check",
-            "0/10 * * * * *",  // Every 10 seconds, starting at 0 seconds
-            Some(serde_json::json!({"action": "health_check"})),
-        ) {
-            Ok(task2) => {
-                match engine_scheduler.schedule(task2).await {
-                    Ok(id) => println!("✅ Recurring task scheduled with ID: {}", id),
-                    Err(e) => eprintln!("❌ Failed to schedule recurring task: {}", e),
-                }
+    // Schedule example tasks
+    let scheduler = engine.scheduler.clone();
+
+    // 1️⃣ One-shot task (runs in 5 seconds)
+    let task1 = Task::new_one_shot(
+        "Process Data",
+        Duration::from_secs(5),
+        Some(serde_json::json!({"action": "process", "data": "sample"})),
+    );
+    let queue_task1 = to_queue_task(task1, TaskPriority::Medium);
+    match scheduler.schedule(queue_task1).await {
+        Ok(id) => println!("✅ One-shot task scheduled with ID: {}", id),
+        Err(e) => eprintln!("❌ Failed to schedule task: {}", e),
+    }
+
+    // 2️⃣ Recurring task (every 10 seconds)
+    match Task::new_recurring(
+        "Health Check",
+        "0/10 * * * * *", // every 10 seconds
+        Some(serde_json::json!({"action": "health_check"})),
+    ) {
+        Ok(task2) => {
+            let queue_task2 = to_queue_task(task2, TaskPriority::High);
+            match scheduler.schedule(queue_task2).await {
+                Ok(id) => println!("✅ Recurring task scheduled with ID: {}", id),
+                Err(e) => eprintln!("❌ Failed to schedule recurring task: {}", e),
             }
-            Err(e) => eprintln!("❌ Invalid cron expression: {}", e),
         }
+        Err(e) => eprintln!("❌ Invalid cron expression for recurring task: {}", e),
+    }
 
-        // Schedule another one-shot task that runs immediately
-        println!("📅 Scheduling immediate one-shot task...");
-        let task3 = Task::new_one_shot(
-            "Immediate Task",
-            Duration::from_secs(0),
-            Some(serde_json::json!({"action": "immediate"})),
-        );
-
-        match engine_scheduler.schedule(task3).await {
-            Ok(id) => println!("✅ Immediate task scheduled with ID: {}", id),
-            Err(e) => eprintln!("❌ Failed to schedule immediate task: {}", e),
-        }
-    });
+    // 3️⃣ Immediate one-shot task
+    let task3 = Task::new_one_shot(
+        "Immediate Task",
+        Duration::from_secs(0),
+        Some(serde_json::json!({"action": "immediate"})),
+    );
+    let queue_task3 = to_queue_task(task3, TaskPriority::Medium);
+    match scheduler.schedule(queue_task3).await {
+        Ok(id) => println!("✅ Immediate task scheduled with ID: {}", id),
+        Err(e) => eprintln!("❌ Failed to schedule immediate task: {}", e),
+    }
 
     // Start the Engine
     if let Err(err) = engine.start().await {

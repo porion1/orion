@@ -1,14 +1,26 @@
-#[derive(Debug, Clone)]
+use serde::{Serialize, Deserialize};
+use uuid::Uuid;
+use std::net::SocketAddr;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Node {
-    pub id: String,
-    pub address: String,
+    pub id: Uuid,
+    pub address: SocketAddr,
 }
 
 impl Node {
-    pub fn new(id: &str, address: &str) -> Self {
-        Self {
-            id: id.to_string(),
-            address: address.to_string(),
-        }
+    /// Create a new node with a random UUID
+    pub fn new(address: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let socket_addr: SocketAddr = address.parse()?;
+        Ok(Self {
+            id: Uuid::new_v4(),
+            address: socket_addr,
+        })
+    }
+
+    /// Create a node with a given UUID
+    pub fn with_id(id: Uuid, address: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let socket_addr: SocketAddr = address.parse()?;
+        Ok(Self { id, address: socket_addr })
     }
 }
