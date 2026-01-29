@@ -98,6 +98,7 @@ impl Engine {
         let _ = scheduler_shutdown_tx.send(true);
         let _ = self.shutdown_tx.send(true);
 
+        // Wait briefly to allow pending tasks to complete
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
         self.set_state(EngineState::Stopped);
@@ -114,7 +115,7 @@ impl Engine {
         Ok(task.id)
     }
 
-    /// Dequeue the next available task
+    /// Dequeue the next available task (priority + scheduled time)
     pub async fn dequeue_task(&self) -> Option<QueueTask> {
         self.task_queue.dequeue().await
     }

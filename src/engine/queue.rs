@@ -69,7 +69,7 @@ impl PartialOrd for QueueTaskWrapper {
 
 impl Ord for QueueTaskWrapper {
     fn cmp(&self, other: &Self) -> Ordering {
-        // earlier scheduled tasks first; break ties with UUID
+        // Earlier scheduled tasks first; break ties deterministically by UUID
         other
             .task
             .scheduled_at
@@ -107,11 +107,12 @@ impl SharedTaskQueue {
         }
     }
 
-    /// Enqueue a new task
+    /// Enqueue a new task (handles backpressure & metrics)
     pub async fn enqueue(&self, task: QueueTask) -> Result<(), String> {
         let mut inner = self.inner.write().await;
 
         if inner.pending_tasks.len() >= self.config.max_queue_size {
+            counter!("orion.scheduler.tasks_rejected_total", 1);
             return Err("Queue is full".into());
         }
 
@@ -142,18 +143,18 @@ impl SharedTaskQueue {
         Ok(())
     }
 
-    /// Dequeue next **ready** task (priority first)
+    /// Dequeue next **ready** task (priority → FIFO fallback)
     pub async fn dequeue(&self) -> Option<QueueTask> {
         let mut inner = self.inner.write().await;
         let now = SystemTime::now();
 
-        // Helper: pop first ready task from a heap
+        // Pop first ready task from a heap
         fn pop_ready(heap: &mut BinaryHeap<QueueTaskWrapper>, now: SystemTime) -> Option<QueueTask> {
             while let Some(wrapper) = heap.peek() {
                 if wrapper.task.scheduled_at <= now {
                     return heap.pop().map(|w| w.task);
                 } else {
-                    break; // not ready yet
+                    break;
                 }
             }
             None
@@ -164,7 +165,7 @@ impl SharedTaskQueue {
             .or_else(|| pop_ready(&mut inner.medium, now))
             .or_else(|| pop_ready(&mut inner.low, now))?;
 
-        // Remove from pending
+        // Remove from pending & update metrics
         inner.pending_tasks.remove(&task_opt.id);
         gauge!("orion.scheduler.tasks_pending", inner.pending_tasks.len() as f64);
 
@@ -188,7 +189,9 @@ impl SharedTaskQueue {
             let queue_clone = self.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(d).await;
-                let _ = queue_clone.enqueue(task).await;
+                if let Err(e) = queue_clone.enqueue(task).await {
+                    eprintln!("⚠️ Failed to re-enqueue task: {}", e);
+                }
             });
             return Ok(());
         }

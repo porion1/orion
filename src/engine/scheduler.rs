@@ -1,11 +1,12 @@
 use super::task::{Task, TaskType, TaskStatus};
-use crate::queue::{SharedTaskQueue, QueueTask};
+use crate::{SharedTaskQueue, QueueTask, TaskPriority}; // <- fixed import
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{SystemTime, Duration};
 use tokio::sync::watch;
 use metrics::{counter, gauge, histogram};
 use uuid::Uuid;
 
+/// Scheduler struct: runs task event loop
 #[derive(Debug)]
 pub struct Scheduler {
     queue: Arc<SharedTaskQueue>,
@@ -13,6 +14,7 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
+    /// Create a new scheduler and start event loop
     pub fn new(queue: Arc<SharedTaskQueue>) -> Arc<Self> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -32,7 +34,7 @@ impl Scheduler {
     /// Main scheduler loop: dequeues ready tasks and executes them
     async fn run_event_loop(self: Arc<Self>, mut shutdown_rx: watch::Receiver<bool>) {
         println!("🔄 Scheduler event loop started");
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
 
         loop {
             tokio::select! {
@@ -72,13 +74,27 @@ impl Scheduler {
         let queue = self.queue.clone();
 
         tokio::spawn(async move {
+            // Wait until scheduled time
+            if let Ok(delay) = qt.scheduled_at.duration_since(SystemTime::now()) {
+                if delay > Duration::ZERO {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+
             task.update_status(TaskStatus::Running);
             println!("✅ Executing Task {}: {}", task.id, task.name);
 
             let start = SystemTime::now();
-            // Simulated work (replace with real task logic)
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            task.update_status(TaskStatus::Completed);
+
+            // Simulated task execution with timeout
+            let exec_result = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::time::sleep(Duration::from_millis(50)).await; // replace with actual work
+            }).await;
+
+            match exec_result {
+                Ok(_) => task.update_status(TaskStatus::Completed),
+                Err(_) => task.update_status(TaskStatus::Failed("Execution timed out".into())),
+            }
 
             histogram!(
                 "orion.scheduler.task_execution_time_ms",
@@ -86,10 +102,18 @@ impl Scheduler {
             );
             counter!("orion.scheduler.tasks_executed_total", 1);
 
+            // Retry failed task if allowed
+            if matches!(task.status, TaskStatus::Failed(_)) {
+                // Convert Task → QueueTask for retry
+                let queue_task: QueueTask = (&task).into(); // use your existing impl elsewhere
+                let _ = queue.retry_task(queue_task, Some(Duration::from_secs(5))).await;
+                return;
+            }
+
             // If recurring, schedule next occurrence
             if let TaskType::Recurring { .. } = task.task_type {
                 if let Some(next) = task.create_next_occurrence() {
-                    queue.enqueue((&next).into()).await.ok();
+                    let _ = queue.enqueue((&next).into()).await;
                 }
             }
         });
