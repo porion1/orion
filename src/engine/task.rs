@@ -47,24 +47,19 @@ mod system_time_serde {
     use std::time::{SystemTime, Duration, UNIX_EPOCH};
 
     pub fn serialize<S>(time: &SystemTime, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
+    where S: Serializer {
         let duration = time.duration_since(UNIX_EPOCH).unwrap_or_default();
         serializer.serialize_u64(duration.as_millis() as u64)
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<SystemTime, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
+    where D: Deserializer<'de> {
         let millis = u64::deserialize(deserializer)?;
         Ok(UNIX_EPOCH + Duration::from_millis(millis))
     }
 }
 
 impl Task {
-    /// Create a one-shot task
     pub fn new_one_shot(
         name: &str,
         delay: Duration,
@@ -75,7 +70,7 @@ impl Task {
             id: Uuid::new_v4(),
             name: name.to_string(),
             task_type: TaskType::OneShot,
-            scheduled_at: now.checked_add(delay).unwrap_or(now),
+            scheduled_at: now + delay,
             payload,
             status: TaskStatus::Pending,
             created_at: now,
@@ -86,34 +81,24 @@ impl Task {
         }
     }
 
-    /// Create a recurring task from a cron expression
     pub fn new_recurring(
         name: &str,
         cron_expr: &str,
         payload: Option<serde_json::Value>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let schedule = Schedule::from_str(cron_expr)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-
+        let schedule = Schedule::from_str(cron_expr)?;
         let now = SystemTime::now();
 
-        // Find the next occurrence
-        let next = schedule.upcoming(Utc)
-            .find(|dt| dt.signed_duration_since(Utc::now()).num_seconds() >= 1)
-            .ok_or_else(|| Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "No upcoming execution time found",
-            )))?;
-
-        let duration = next.signed_duration_since(Utc::now());
-        let scheduled_at = now.checked_add(Duration::from_secs(duration.num_seconds().max(1) as u64))
-            .unwrap_or(now);
+        let next = schedule.upcoming(Utc).next().ok_or("No next run")?;
+        let delay = Duration::from_secs(
+            next.signed_duration_since(Utc::now()).num_seconds().max(1) as u64
+        );
 
         Ok(Self {
             id: Uuid::new_v4(),
             name: name.to_string(),
             task_type: TaskType::Recurring { cron_expr: cron_expr.to_string() },
-            scheduled_at,
+            scheduled_at: now + delay,
             payload,
             status: TaskStatus::Pending,
             created_at: now,
@@ -124,58 +109,38 @@ impl Task {
         })
     }
 
-    /// Generate the next occurrence for a recurring task
     pub fn create_next_occurrence(&self) -> Option<Self> {
-        match &self.task_type {
-            TaskType::OneShot => None,
-            TaskType::Recurring { cron_expr } => {
-                let schedule = Schedule::from_str(cron_expr).ok()?;
-                let now = SystemTime::now();
+        let TaskType::Recurring { cron_expr } = &self.task_type else { return None };
 
-                let next = schedule.upcoming(Utc)
-                    .find(|dt| dt.signed_duration_since(Utc::now()).num_seconds() >= 1)?;
+        let schedule = Schedule::from_str(cron_expr).ok()?;
+        let next = schedule.upcoming(Utc).next()?;
+        let delay = Duration::from_secs(
+            next.signed_duration_since(Utc::now()).num_seconds().max(1) as u64
+        );
 
-                let duration = next.signed_duration_since(Utc::now());
-                let scheduled_at = now.checked_add(Duration::from_secs(duration.num_seconds().max(1) as u64))
-                    .unwrap_or(now);
-
-                Some(Self {
-                    id: Uuid::new_v4(), // ✅ New UUID for each occurrence
-                    name: self.name.clone(),
-                    task_type: TaskType::Recurring { cron_expr: cron_expr.clone() },
-                    scheduled_at,
-                    payload: self.payload.clone(),
-                    status: TaskStatus::Pending,
-                    created_at: now,
-                    updated_at: now,
-                    retry_count: 0,
-                    max_retries: self.max_retries,
-                    metadata: self.metadata.clone(),
-                })
-            }
-        }
+        let now = SystemTime::now();
+        Some(Self {
+            id: Uuid::new_v4(),
+            name: self.name.clone(),
+            task_type: self.task_type.clone(),
+            scheduled_at: now + delay,
+            payload: self.payload.clone(),
+            status: TaskStatus::Pending,
+            created_at: now,
+            updated_at: now,
+            retry_count: 0,
+            max_retries: self.max_retries,
+            metadata: self.metadata.clone(),
+        })
     }
 
-    /// Update the task status
     pub fn update_status(&mut self, status: TaskStatus) {
         self.status = status;
         self.updated_at = SystemTime::now();
     }
-
-    /// Check if task should retry
-    pub fn should_retry(&self) -> bool {
-        matches!(self.status, TaskStatus::Failed(_)) &&
-            self.retry_count < self.max_retries
-    }
-
-    /// Increment retry count
-    pub fn increment_retry(&mut self) {
-        self.retry_count += 1;
-        self.updated_at = SystemTime::now();
-    }
 }
 
-/// Optional conversion: Task → QueueTask
+/// ✅ FIXED: Task → QueueTask (task_type INCLUDED)
 impl From<&Task> for crate::queue::QueueTask {
     fn from(task: &Task) -> Self {
         crate::queue::QueueTask {
@@ -183,7 +148,10 @@ impl From<&Task> for crate::queue::QueueTask {
             name: task.name.clone(),
             scheduled_at: task.scheduled_at,
             priority: crate::queue::TaskPriority::Medium,
-            payload: task.payload.clone(), // Option<Value>
+            payload: task.payload.clone(),
+            retry_count: task.retry_count,
+            max_retries: task.max_retries,
+            task_type: task.task_type.clone(), // ✅ FIX
         }
     }
 }

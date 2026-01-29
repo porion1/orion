@@ -27,6 +27,7 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Initialize engine with config
     pub fn new(config: EngineConfig) -> Self {
         let (shutdown_tx, _) = watch::channel(false);
 
@@ -41,15 +42,14 @@ impl Engine {
             }
         }
 
-        // Initialize task queue
+        // Configure shared task queue
         let queue_config = QueueConfig {
             max_queue_size: 10_000,
             persistence_path: config.persistence_path.clone(),
         };
-
         let task_queue = Arc::new(SharedTaskQueue::new(queue_config));
 
-        // 🔥 FIX: inject the SAME queue into the scheduler
+        // Inject same queue into scheduler
         let scheduler = Scheduler::new(Arc::clone(&task_queue));
 
         Self {
@@ -61,11 +61,13 @@ impl Engine {
         }
     }
 
+    /// Update engine state with logging
     pub fn set_state(&mut self, new_state: EngineState) {
         println!("🔄 Engine state changed: {:?} → {:?}", self.state, new_state);
         self.state = new_state;
     }
 
+    /// Start engine asynchronously
     pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.set_state(EngineState::Running);
         println!("🚀 Engine starting with config: {:?}", self.config);
@@ -80,6 +82,7 @@ impl Engine {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let scheduler_shutdown_tx = self.scheduler.get_shutdown_sender();
 
+        // Wait for shutdown signal (Ctrl+C or internal)
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 println!("Received shutdown signal, stopping Engine...");
@@ -91,9 +94,9 @@ impl Engine {
 
         self.set_state(EngineState::Draining);
 
-        // Notify scheduler to stop
-        scheduler_shutdown_tx.send(true)?;
-        self.shutdown_tx.send(true)?;
+        // Notify scheduler to stop and persist tasks
+        let _ = scheduler_shutdown_tx.send(true);
+        let _ = self.shutdown_tx.send(true);
 
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
@@ -102,7 +105,7 @@ impl Engine {
         Ok(())
     }
 
-    /// Schedule a task via shared queue
+    /// Schedule a new task into the shared queue
     pub async fn schedule_task(
         &self,
         task: QueueTask,
@@ -111,17 +114,17 @@ impl Engine {
         Ok(task.id)
     }
 
-    /// Dequeue a single task
+    /// Dequeue the next available task
     pub async fn dequeue_task(&self) -> Option<QueueTask> {
         self.task_queue.dequeue().await
     }
 
-    /// Get all pending tasks
+    /// Get all pending tasks in the queue
     pub async fn get_pending_tasks(&self) -> Vec<QueueTask> {
         self.task_queue.get_all_pending().await
     }
 
-    /// Print engine status
+    /// Print current engine status for debugging
     pub async fn print_status(&self) {
         let pending = self.task_queue.len().await;
         println!("=== Orion Engine Status ===");

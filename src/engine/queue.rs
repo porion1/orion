@@ -5,8 +5,11 @@ use tokio::sync::RwLock;
 use serde::{Serialize, Deserialize};
 use serde_json::Value;
 use uuid::Uuid;
-use std::time::SystemTime;
+use std::time::{SystemTime, Duration};
 use sled::Db;
+use metrics::{counter, gauge};
+
+use crate::task::TaskType;
 
 /// Task priority levels
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -16,14 +19,17 @@ pub enum TaskPriority {
     Low = 1,
 }
 
-/// Task wrapper for queue operations
+/// Task stored in the queue
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueTask {
     pub id: Uuid,
     pub name: String,
     pub scheduled_at: SystemTime,
     pub priority: TaskPriority,
-    pub payload: Option<Value>, // ✅ FIXED
+    pub payload: Option<Value>,
+    pub retry_count: u32,
+    pub max_retries: u32,
+    pub task_type: TaskType,
 }
 
 /// Queue configuration
@@ -33,7 +39,7 @@ pub struct QueueConfig {
     pub persistence_path: Option<String>,
 }
 
-/// Inner state of the queue
+/// Internal queue state
 #[derive(Debug)]
 struct QueueInner {
     high: BinaryHeap<QueueTaskWrapper>,
@@ -42,7 +48,7 @@ struct QueueInner {
     pending_tasks: HashMap<Uuid, QueueTask>,
 }
 
-/// Wrapper for ordering tasks in BinaryHeap
+/// Wrapper for BinaryHeap ordering (earlier tasks first)
 #[derive(Debug, Clone)]
 struct QueueTaskWrapper {
     task: QueueTask,
@@ -63,8 +69,7 @@ impl PartialOrd for QueueTaskWrapper {
 
 impl Ord for QueueTaskWrapper {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Primary: earlier scheduled time first
-        // Secondary: stable tie-breaker by UUID
+        // earlier scheduled tasks first; break ties with UUID
         other
             .task
             .scheduled_at
@@ -73,7 +78,7 @@ impl Ord for QueueTaskWrapper {
     }
 }
 
-/// Shared task queue with async-safe access
+/// Shared task queue
 #[derive(Debug, Clone)]
 pub struct SharedTaskQueue {
     inner: Arc<RwLock<QueueInner>>,
@@ -82,7 +87,7 @@ pub struct SharedTaskQueue {
 }
 
 impl SharedTaskQueue {
-    /// Create a new shared task queue
+    /// Create a new queue
     pub fn new(config: QueueConfig) -> Self {
         let db = config.persistence_path.as_ref().map(|path| {
             Arc::new(sled::open(path).expect("Failed to open queue database"))
@@ -102,20 +107,19 @@ impl SharedTaskQueue {
         }
     }
 
-    /// Enqueue a task
+    /// Enqueue a new task
     pub async fn enqueue(&self, task: QueueTask) -> Result<(), String> {
         let mut inner = self.inner.write().await;
 
         if inner.pending_tasks.len() >= self.config.max_queue_size {
-            return Err("Queue is full".to_string());
+            return Err("Queue is full".into());
         }
 
         if inner.pending_tasks.contains_key(&task.id) {
-            return Err("Task already exists in queue".to_string());
+            return Err("Task already exists".into());
         }
 
         let wrapper = QueueTaskWrapper { task: task.clone() };
-
         match task.priority {
             TaskPriority::High => inner.high.push(wrapper),
             TaskPriority::Medium => inner.medium.push(wrapper),
@@ -124,7 +128,11 @@ impl SharedTaskQueue {
 
         inner.pending_tasks.insert(task.id, task.clone());
 
-        // Persist
+        // Metrics
+        counter!("orion.scheduler.tasks_scheduled_total", 1);
+        gauge!("orion.scheduler.tasks_pending", inner.pending_tasks.len() as f64);
+
+        // Persist task
         if let Some(db) = &self.db {
             let serialized = serde_json::to_vec(&task).map_err(|e| e.to_string())?;
             db.insert(task.id.as_bytes(), serialized)
@@ -134,45 +142,73 @@ impl SharedTaskQueue {
         Ok(())
     }
 
-    /// Dequeue next task (priority first, scheduled_at next)
+    /// Dequeue next **ready** task (priority first)
     pub async fn dequeue(&self) -> Option<QueueTask> {
         let mut inner = self.inner.write().await;
+        let now = SystemTime::now();
 
-        let wrapper_opt = if let Some(w) = inner.high.pop() {
-            Some(w)
-        } else if let Some(w) = inner.medium.pop() {
-            Some(w)
-        } else if let Some(w) = inner.low.pop() {
-            Some(w)
-        } else {
+        // Helper: pop first ready task from a heap
+        fn pop_ready(heap: &mut BinaryHeap<QueueTaskWrapper>, now: SystemTime) -> Option<QueueTask> {
+            while let Some(wrapper) = heap.peek() {
+                if wrapper.task.scheduled_at <= now {
+                    return heap.pop().map(|w| w.task);
+                } else {
+                    break; // not ready yet
+                }
+            }
             None
-        };
-
-        let task = wrapper_opt.map(|w| w.task)?;
-
-        inner.pending_tasks.remove(&task.id);
-
-        // Remove from persistence
-        if let Some(db) = &self.db {
-            let _ = db.remove(task.id.as_bytes());
         }
 
-        Some(task)
+        // Try high → medium → low
+        let task_opt = pop_ready(&mut inner.high, now)
+            .or_else(|| pop_ready(&mut inner.medium, now))
+            .or_else(|| pop_ready(&mut inner.low, now))?;
+
+        // Remove from pending
+        inner.pending_tasks.remove(&task_opt.id);
+        gauge!("orion.scheduler.tasks_pending", inner.pending_tasks.len() as f64);
+
+        // Remove from DB
+        if let Some(db) = &self.db {
+            let _ = db.remove(task_opt.id.as_bytes());
+        }
+
+        Some(task_opt)
     }
 
-    /// Get all pending tasks (safe public access)
+    /// Retry a task with optional delay
+    pub async fn retry_task(&self, mut task: QueueTask, delay: Option<Duration>) -> Result<(), String> {
+        if task.retry_count >= task.max_retries {
+            counter!("orion.scheduler.tasks_failed_total", 1);
+            return Err("Max retries reached".into());
+        }
+        task.retry_count += 1;
+
+        if let Some(d) = delay {
+            let queue_clone = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(d).await;
+                let _ = queue_clone.enqueue(task).await;
+            });
+            return Ok(());
+        }
+
+        self.enqueue(task).await
+    }
+
+    /// Return all pending tasks
     pub async fn get_all_pending(&self) -> Vec<QueueTask> {
         let inner = self.inner.read().await;
         inner.pending_tasks.values().cloned().collect()
     }
 
-    /// Return number of pending tasks
+    /// Return pending count
     pub async fn len(&self) -> usize {
         let inner = self.inner.read().await;
         inner.pending_tasks.len()
     }
 
-    /// Persist all tasks
+    /// Persist all tasks to DB
     pub async fn persist_all(&self) {
         if let Some(db) = &self.db {
             let inner = self.inner.read().await;
@@ -184,13 +220,12 @@ impl SharedTaskQueue {
         }
     }
 
-    /// Load persisted tasks
+    /// Load persisted tasks from DB
     pub async fn load_persisted(&self) {
         if let Some(db) = &self.db {
             for result in db.iter() {
                 if let Ok((_key, value)) = result {
                     if let Ok(task) = serde_json::from_slice::<QueueTask>(&value) {
-                        // Respect max queue size
                         if self.len().await < self.config.max_queue_size {
                             let _ = self.enqueue(task).await;
                         }
