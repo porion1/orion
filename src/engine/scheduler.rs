@@ -1,141 +1,158 @@
-use super::task::{Task, TaskType, TaskStatus};
-use crate::{SharedTaskQueue, QueueTask, TaskPriority}; // <- fixed import
+use crate::engine::executor::TaskExecutor;
+use crate::engine::queue::{QueueTask, SharedTaskQueue};
+use crate::engine::task::{Task, TaskType};
+use metrics::{counter, gauge};
 use std::sync::Arc;
-use std::time::{SystemTime, Duration};
+use std::time::{Duration, SystemTime};
 use tokio::sync::watch;
-use metrics::{counter, gauge, histogram};
+use tokio::time::interval;
 use uuid::Uuid;
 
-/// Scheduler struct: runs task event loop
+/// Scheduler drives task dispatching and lifecycle orchestration
 #[derive(Debug)]
 pub struct Scheduler {
     queue: Arc<SharedTaskQueue>,
+    executor: Arc<TaskExecutor>,
     shutdown_tx: watch::Sender<bool>,
 }
 
 impl Scheduler {
-    /// Create a new scheduler and start event loop
-    pub fn new(queue: Arc<SharedTaskQueue>) -> Arc<Self> {
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    /// Create a new scheduler
+    pub fn new(
+        queue: Arc<SharedTaskQueue>,
+        executor: Arc<TaskExecutor>,
+    ) -> Self {
+        let (shutdown_tx, _) = watch::channel(false);
 
-        let scheduler = Arc::new(Self {
+        Self {
             queue,
-            shutdown_tx: shutdown_tx.clone(),
-        });
-
-        let s = scheduler.clone();
-        tokio::spawn(async move {
-            s.run_event_loop(shutdown_rx).await;
-        });
-
-        scheduler
+            executor,
+            shutdown_tx,
+        }
     }
 
-    /// Main scheduler loop: dequeues ready tasks and executes them
-    async fn run_event_loop(self: Arc<Self>, mut shutdown_rx: watch::Receiver<bool>) {
-        println!("🔄 Scheduler event loop started");
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
+    /// Start the scheduler main loop
+    pub async fn start(self: Arc<Self>) -> anyhow::Result<()> {
+        println!("🔄 Scheduler started");
+        let mut ticker = interval(Duration::from_secs(1));
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         loop {
             tokio::select! {
-                _ = tick.tick() => {
-                    while let Some(task) = self.queue.dequeue().await {
-                        self.execute(task).await;
-                    }
+                _ = ticker.tick() => {
+                    self.process_ready_tasks().await;
                     self.update_metrics().await;
                 }
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
-                        println!("🛑 Scheduler shutting down...");
-                        self.queue.persist_all().await;
+                        println!("🛑 Scheduler shutting down");
+                        // FIXED: Handle the Result properly
+                        if let Err(e) = self.queue.persist_all().await {
+                            eprintln!("⚠️ Failed to persist queue state during shutdown: {}", e);
+                        }
                         break;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Dequeue and submit all available tasks
+    async fn process_ready_tasks(&self) {
+        while let Some(task) = self.queue.dequeue().await {
+            self.dispatch(task).await;
+        }
+    }
+
+    /// Dispatch task to executor
+    async fn dispatch(&self, task: QueueTask) {
+        counter!("orion.scheduler.tasks_scheduled_total", 1);
+
+        // Wait until scheduled execution time
+        if let Ok(delay) = task.scheduled_at.duration_since(SystemTime::now()) {
+            if delay > Duration::ZERO {
+                tokio::time::sleep(delay).await;
+            }
+        }
+
+        let task_id = task.id;
+        let executor = Arc::clone(&self.executor);
+        let queue = Arc::clone(&self.queue);
+
+        // Execute the task
+        executor.execute_task(task.clone()).await;
+
+        // Check result after some delay to allow execution to complete
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Handle retry logic
+        self.handle_task_result(task_id, &task, &executor, &queue).await;
+
+        // Handle recurring tasks
+        self.handle_recurring_tasks(&task, &queue).await;
+    }
+
+    /// Handle task result and retry logic
+    async fn handle_task_result(
+        &self,
+        task_id: Uuid,
+        task: &QueueTask,
+        executor: &Arc<TaskExecutor>,
+        queue: &Arc<SharedTaskQueue>,
+    ) {
+        if let Some(result) = executor.get_result(task_id).await {
+            if !result.success && task.retry_count < task.max_retries {
+                let mut retry = task.clone();
+                retry.retry_count += 1;
+                retry.scheduled_at = SystemTime::now() + Duration::from_secs(5);
+
+                match queue.enqueue(retry).await {
+                    Ok(_) => {
+                        counter!("orion.scheduler.tasks_retried_total", 1);
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️ Failed to enqueue retry for task {}: {}", task_id, e);
+                        counter!("orion.scheduler.tasks_retry_failed_total", 1);
                     }
                 }
             }
         }
     }
 
-    /// Execute a task asynchronously
-    async fn execute(&self, qt: QueueTask) {
-        let mut task = Task {
-            id: qt.id,
-            name: qt.name.clone(),
-            task_type: qt.task_type.clone(),
-            status: TaskStatus::Pending,
-            scheduled_at: qt.scheduled_at,
-            payload: qt.payload.clone(),
-            created_at: SystemTime::now(),
-            updated_at: SystemTime::now(),
-            retry_count: qt.retry_count,
-            max_retries: qt.max_retries,
-            metadata: None,
-        };
-
-        let queue = self.queue.clone();
-
-        tokio::spawn(async move {
-            // Wait until scheduled time
-            if let Ok(delay) = qt.scheduled_at.duration_since(SystemTime::now()) {
-                if delay > Duration::ZERO {
-                    tokio::time::sleep(delay).await;
+    /// Handle recurring tasks
+    async fn handle_recurring_tasks(&self, task: &QueueTask, queue: &Arc<SharedTaskQueue>) {
+        if let TaskType::Recurring { .. } = task.task_type {
+            if let Some(next) = Task::from_queue_task(task).create_next_occurrence() {
+                match queue.enqueue((&next).into()).await {
+                    Ok(_) => {
+                        counter!("orion.scheduler.tasks_rescheduled_total", 1);
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️ Failed to reschedule recurring task {}: {}", task.id, e);
+                        counter!("orion.scheduler.tasks_reschedule_failed_total", 1);
+                    }
                 }
             }
-
-            task.update_status(TaskStatus::Running);
-            println!("✅ Executing Task {}: {}", task.id, task.name);
-
-            let start = SystemTime::now();
-
-            // Simulated task execution with timeout
-            let exec_result = tokio::time::timeout(Duration::from_secs(10), async {
-                tokio::time::sleep(Duration::from_millis(50)).await; // replace with actual work
-            }).await;
-
-            match exec_result {
-                Ok(_) => task.update_status(TaskStatus::Completed),
-                Err(_) => task.update_status(TaskStatus::Failed("Execution timed out".into())),
-            }
-
-            histogram!(
-                "orion.scheduler.task_execution_time_ms",
-                start.elapsed().unwrap().as_millis() as f64
-            );
-            counter!("orion.scheduler.tasks_executed_total", 1);
-
-            // Retry failed task if allowed
-            if matches!(task.status, TaskStatus::Failed(_)) {
-                // Convert Task → QueueTask for retry
-                let queue_task: QueueTask = (&task).into(); // use your existing impl elsewhere
-                let _ = queue.retry_task(queue_task, Some(Duration::from_secs(5))).await;
-                return;
-            }
-
-            // If recurring, schedule next occurrence
-            if let TaskType::Recurring { .. } = task.task_type {
-                if let Some(next) = task.create_next_occurrence() {
-                    let _ = queue.enqueue((&next).into()).await;
-                }
-            }
-        });
-
-        counter!("orion.scheduler.tasks_scheduled_total", 1);
+        }
     }
 
-    /// Update metrics for pending tasks
+    /// Emit scheduler metrics
     async fn update_metrics(&self) {
         let pending = self.queue.len().await;
         gauge!("orion.scheduler.tasks_pending", pending as f64);
     }
 
-    /// Public API to schedule a task
-    pub async fn schedule(&self, task: QueueTask) -> Result<Uuid, String> {
+    /// Public API: schedule a task
+    pub async fn schedule(&self, task: QueueTask) -> anyhow::Result<Uuid> {
         let id = task.id;
         self.queue.enqueue(task).await?;
         Ok(id)
     }
 
-    /// Return shutdown sender
-    pub fn get_shutdown_sender(&self) -> watch::Sender<bool> {
+    /// Shutdown signal handle
+    pub fn shutdown_handle(&self) -> watch::Sender<bool> {
         self.shutdown_tx.clone()
     }
 }

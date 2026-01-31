@@ -1,17 +1,19 @@
-use std::collections::{BinaryHeap, HashMap};
-use std::cmp::Ordering;
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use serde::{Serialize, Deserialize};
+use crate::engine::task::TaskType;
+use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use uuid::Uuid;
-use std::time::{SystemTime, Duration};
 use sled::Db;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use tokio::sync::RwLock;
+use uuid::Uuid;
 use metrics::{counter, gauge};
 
-use crate::task::TaskType;
-
+/// --------------------------------
 /// Task priority levels
+/// --------------------------------
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum TaskPriority {
     High = 3,
@@ -19,7 +21,9 @@ pub enum TaskPriority {
     Low = 1,
 }
 
+/// --------------------------------
 /// Task stored in the queue
+/// --------------------------------
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueTask {
     pub id: Uuid,
@@ -32,23 +36,19 @@ pub struct QueueTask {
     pub task_type: TaskType,
 }
 
+/// --------------------------------
 /// Queue configuration
+/// --------------------------------
 #[derive(Debug, Clone)]
 pub struct QueueConfig {
     pub max_queue_size: usize,
     pub persistence_path: Option<String>,
 }
 
-/// Internal queue state
-#[derive(Debug)]
-struct QueueInner {
-    high: BinaryHeap<QueueTaskWrapper>,
-    medium: BinaryHeap<QueueTaskWrapper>,
-    low: BinaryHeap<QueueTaskWrapper>,
-    pending_tasks: HashMap<Uuid, QueueTask>,
-}
-
-/// Wrapper for BinaryHeap ordering (earlier tasks first)
+/// --------------------------------
+/// Wrapper for BinaryHeap ordering
+/// Earlier scheduled tasks come first
+/// --------------------------------
 #[derive(Debug, Clone)]
 struct QueueTaskWrapper {
     task: QueueTask,
@@ -69,7 +69,7 @@ impl PartialOrd for QueueTaskWrapper {
 
 impl Ord for QueueTaskWrapper {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Earlier scheduled tasks first; break ties deterministically by UUID
+        // BinaryHeap is max-heap, so reverse order
         other
             .task
             .scheduled_at
@@ -78,7 +78,20 @@ impl Ord for QueueTaskWrapper {
     }
 }
 
+/// --------------------------------
+/// Internal queue state
+/// --------------------------------
+#[derive(Debug)]
+struct QueueInner {
+    high: BinaryHeap<QueueTaskWrapper>,
+    medium: BinaryHeap<QueueTaskWrapper>,
+    low: BinaryHeap<QueueTaskWrapper>,
+    pending_tasks: HashMap<Uuid, QueueTask>,
+}
+
+/// --------------------------------
 /// Shared task queue
+/// --------------------------------
 #[derive(Debug, Clone)]
 pub struct SharedTaskQueue {
     inner: Arc<RwLock<QueueInner>>,
@@ -90,7 +103,7 @@ impl SharedTaskQueue {
     /// Create a new queue
     pub fn new(config: QueueConfig) -> Self {
         let db = config.persistence_path.as_ref().map(|path| {
-            Arc::new(sled::open(path).expect("Failed to open queue database"))
+            Arc::new(sled::open(path).expect("Failed to open queue DB"))
         });
 
         let inner = QueueInner {
@@ -107,17 +120,17 @@ impl SharedTaskQueue {
         }
     }
 
-    /// Enqueue a new task (handles backpressure & metrics)
-    pub async fn enqueue(&self, task: QueueTask) -> Result<(), String> {
+    /// Enqueue a new task
+    pub async fn enqueue(&self, task: QueueTask) -> Result<()> {
         let mut inner = self.inner.write().await;
 
         if inner.pending_tasks.len() >= self.config.max_queue_size {
             counter!("orion.scheduler.tasks_rejected_total", 1);
-            return Err("Queue is full".into());
+            return Err(anyhow!("Queue is full (max: {})", self.config.max_queue_size));
         }
 
         if inner.pending_tasks.contains_key(&task.id) {
-            return Err("Task already exists".into());
+            return Err(anyhow!("Task already exists with ID: {}", task.id));
         }
 
         let wrapper = QueueTaskWrapper { task: task.clone() };
@@ -129,26 +142,25 @@ impl SharedTaskQueue {
 
         inner.pending_tasks.insert(task.id, task.clone());
 
-        // Metrics
         counter!("orion.scheduler.tasks_scheduled_total", 1);
         gauge!("orion.scheduler.tasks_pending", inner.pending_tasks.len() as f64);
 
         // Persist task
         if let Some(db) = &self.db {
-            let serialized = serde_json::to_vec(&task).map_err(|e| e.to_string())?;
+            let serialized = serde_json::to_vec(&task)
+                .map_err(|e| anyhow!("Failed to serialize task: {}", e))?;
             db.insert(task.id.as_bytes(), serialized)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| anyhow!("Failed to persist task to DB: {}", e))?;
         }
 
         Ok(())
     }
 
-    /// Dequeue next **ready** task (priority → FIFO fallback)
+    /// Dequeue next ready task
     pub async fn dequeue(&self) -> Option<QueueTask> {
         let mut inner = self.inner.write().await;
         let now = SystemTime::now();
 
-        // Pop first ready task from a heap
         fn pop_ready(heap: &mut BinaryHeap<QueueTaskWrapper>, now: SystemTime) -> Option<QueueTask> {
             while let Some(wrapper) = heap.peek() {
                 if wrapper.task.scheduled_at <= now {
@@ -160,16 +172,13 @@ impl SharedTaskQueue {
             None
         }
 
-        // Try high → medium → low
         let task_opt = pop_ready(&mut inner.high, now)
             .or_else(|| pop_ready(&mut inner.medium, now))
             .or_else(|| pop_ready(&mut inner.low, now))?;
 
-        // Remove from pending & update metrics
         inner.pending_tasks.remove(&task_opt.id);
         gauge!("orion.scheduler.tasks_pending", inner.pending_tasks.len() as f64);
 
-        // Remove from DB
         if let Some(db) = &self.db {
             let _ = db.remove(task_opt.id.as_bytes());
         }
@@ -177,12 +186,13 @@ impl SharedTaskQueue {
         Some(task_opt)
     }
 
-    /// Retry a task with optional delay
-    pub async fn retry_task(&self, mut task: QueueTask, delay: Option<Duration>) -> Result<(), String> {
+    /// Retry task with optional delay
+    pub async fn retry_task(&self, mut task: QueueTask, delay: Option<Duration>) -> Result<()> {
         if task.retry_count >= task.max_retries {
             counter!("orion.scheduler.tasks_failed_total", 1);
-            return Err("Max retries reached".into());
+            return Err(anyhow!("Max retries reached (max: {})", task.max_retries));
         }
+
         task.retry_count += 1;
 
         if let Some(d) = delay {
@@ -211,30 +221,45 @@ impl SharedTaskQueue {
         inner.pending_tasks.len()
     }
 
-    /// Persist all tasks to DB
-    pub async fn persist_all(&self) {
+    /// Check if queue is empty
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
+    }
+
+    /// Persist all tasks
+    pub async fn persist_all(&self) -> Result<()> {
         if let Some(db) = &self.db {
             let inner = self.inner.read().await;
             for task in inner.pending_tasks.values() {
                 if let Ok(serialized) = serde_json::to_vec(task) {
-                    let _ = db.insert(task.id.as_bytes(), serialized);
+                    db.insert(task.id.as_bytes(), serialized)
+                        .map_err(|e| anyhow!("Failed to persist task {}: {}", task.id, e))?;
                 }
             }
         }
+        Ok(())
     }
 
     /// Load persisted tasks from DB
-    pub async fn load_persisted(&self) {
+    pub async fn load_persisted(&self) -> Result<()> {
         if let Some(db) = &self.db {
             for result in db.iter() {
-                if let Ok((_key, value)) = result {
-                    if let Ok(task) = serde_json::from_slice::<QueueTask>(&value) {
-                        if self.len().await < self.config.max_queue_size {
-                            let _ = self.enqueue(task).await;
+                match result {
+                    Ok((_key, value)) => {
+                        if let Ok(task) = serde_json::from_slice::<QueueTask>(&value) {
+                            if self.len().await < self.config.max_queue_size {
+                                if let Err(e) = self.enqueue(task).await {
+                                    eprintln!("⚠️ Failed to load persisted task: {}", e);
+                                }
+                            }
                         }
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️ Error reading from persistence DB: {}", e);
                     }
                 }
             }
         }
+        Ok(())
     }
 }

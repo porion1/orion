@@ -1,6 +1,17 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("Failed to read config file: {0}")]
+    IoError(#[from] std::io::Error),
+    #[error("Failed to parse config: {0}")]
+    ParseError(String),
+    #[error("Invalid configuration: {0}")]
+    ValidationError(String),
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct EngineConfig {
@@ -8,23 +19,25 @@ pub struct EngineConfig {
     pub max_concurrent_tasks: usize,
     pub logging_level: Option<String>,
     pub persistence_path: Option<String>,
-    pub metrics_port: u16,     // u16 already guarantees 0..=65535
+    pub metrics_port: u16,
     pub metrics_enabled: bool,
 }
 
 impl EngineConfig {
     /// Load config from YAML file
-    pub fn from_yaml(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn from_yaml(path: &str) -> Result<Self, ConfigError> {
         let contents = fs::read_to_string(path)?;
-        let config: EngineConfig = serde_yaml::from_str(&contents)?;
+        let config: EngineConfig = serde_yaml::from_str(&contents)
+            .map_err(|e| ConfigError::ParseError(format!("YAML parsing error: {}", e)))?;
         config.validate()?;
         Ok(config)
     }
 
     /// Load config from TOML file
-    pub fn from_toml(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn from_toml(path: &str) -> Result<Self, ConfigError> {
         let contents = fs::read_to_string(path)?;
-        let config: EngineConfig = toml::from_str(&contents)?;
+        let config: EngineConfig = toml::from_str(&contents)
+            .map_err(|e| ConfigError::ParseError(format!("TOML parsing error: {}", e)))?;
         config.validate()?;
         Ok(config)
     }
@@ -74,32 +87,44 @@ impl EngineConfig {
     }
 
     /// Validate configuration
-    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn validate(&self) -> Result<(), ConfigError> {
         if self.scheduler_tick_secs == 0 {
-            return Err("scheduler_tick_secs must be > 0".into());
+            return Err(ConfigError::ValidationError(
+                "scheduler_tick_secs must be > 0".into(),
+            ));
         }
 
         if self.max_concurrent_tasks == 0 {
-            return Err("max_concurrent_tasks must be > 0".into());
+            return Err(ConfigError::ValidationError(
+                "max_concurrent_tasks must be > 0".into(),
+            ));
         }
 
         // u16 already ensures 0..=65535
         if self.metrics_port == 0 {
-            return Err("metrics_port cannot be 0".into());
+            return Err(ConfigError::ValidationError(
+                "metrics_port cannot be 0".into(),
+            ));
         }
 
         if let Some(level) = &self.logging_level {
             let level = level.to_lowercase();
             let allowed = ["trace", "debug", "info", "warn", "error"];
             if !allowed.contains(&level.as_str()) {
-                return Err(format!(
+                return Err(ConfigError::ValidationError(format!(
                     "invalid logging_level '{}'. Must be one of: {:?}",
                     level, allowed
-                )
-                    .into());
+                )));
             }
         }
 
         Ok(())
+    }
+}
+
+// Add Default trait implementation for convenience
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self::defaults()
     }
 }

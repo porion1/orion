@@ -4,134 +4,135 @@ pub mod scheduler;
 pub mod state;
 pub mod task;
 pub mod queue;
+pub mod executor;
 
-// Re-export main types
 pub use config::EngineConfig;
 pub use scheduler::Scheduler;
 pub use state::EngineState;
 pub use task::Task;
-pub use queue::{SharedTaskQueue, QueueConfig, QueueTask, TaskPriority};
+pub use queue::{QueueTask, SharedTaskQueue, QueueConfig, TaskPriority};
+pub use executor::TaskExecutor;
 
-use tokio::sync::watch;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{watch, RwLock};
 use uuid::Uuid;
 
 /// Main Engine struct
 #[derive(Debug)]
 pub struct Engine {
     pub scheduler: Arc<Scheduler>,
+    pub executor: Arc<TaskExecutor>,
     pub config: EngineConfig,
-    pub state: EngineState,
+    pub state: Arc<RwLock<EngineState>>,
     pub task_queue: Arc<SharedTaskQueue>,
     shutdown_tx: watch::Sender<bool>,
 }
 
 impl Engine {
-    /// Initialize engine with config
     pub fn new(config: EngineConfig) -> Self {
         let (shutdown_tx, _) = watch::channel(false);
 
-        // Start metrics server if enabled
-        if config.should_enable_metrics() {
-            match crate::metrics::start_metrics_server(config.metrics_port) {
-                Ok(_) => println!("📊 Metrics server started on port {}", config.metrics_port),
-                Err(e) => {
-                    eprintln!("⚠️ Failed to start metrics server: {}", e);
-                    eprintln!("⚠️ Metrics will not be available");
-                }
-            }
-        }
-
-        // Configure shared task queue
+        // Shared task queue
         let queue_config = QueueConfig {
             max_queue_size: 10_000,
             persistence_path: config.persistence_path.clone(),
         };
         let task_queue = Arc::new(SharedTaskQueue::new(queue_config));
 
-        // Inject same queue into scheduler
-        let scheduler = Scheduler::new(Arc::clone(&task_queue));
+        // Executor
+        let executor = Arc::new(TaskExecutor::new(
+            Arc::clone(&task_queue),
+            config.max_concurrent_tasks,
+            Duration::from_secs(5),
+        ));
+
+        // Scheduler
+        let scheduler = Arc::new(Scheduler::new(
+            Arc::clone(&task_queue),
+            Arc::clone(&executor),
+        ));
 
         Self {
             scheduler,
+            executor,
             config,
+            state: Arc::new(RwLock::new(EngineState::Init)),
             task_queue,
-            state: EngineState::Init,
             shutdown_tx,
         }
     }
 
-    /// Update engine state with logging
-    pub fn set_state(&mut self, new_state: EngineState) {
-        println!("🔄 Engine state changed: {:?} → {:?}", self.state, new_state);
-        self.state = new_state;
-    }
+    pub async fn start(self: Arc<Self>) -> anyhow::Result<()> {
+        self.set_state(EngineState::Running).await;
+        println!("🚀 Engine starting...");
 
-    /// Start engine asynchronously
-    pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.set_state(EngineState::Running);
-        println!("🚀 Engine starting with config: {:?}", self.config);
+        // Start scheduler first
+        let scheduler_clone = Arc::clone(&self.scheduler);
+        tokio::spawn(async move {
+            if let Err(e) = scheduler_clone.start().await {
+                eprintln!("Scheduler error: {}", e);
+            }
+        });
 
-        if self.config.should_enable_metrics() {
-            println!(
-                "📊 Metrics available at: http://localhost:{}/metrics",
-                self.config.metrics_port
-            );
-        }
+        // Start executor loop
+        let executor_clone = Arc::clone(&self.executor);
+        tokio::spawn(async move {
+            executor_clone.start().await;
+        });
 
+        // Wait for shutdown
         let mut shutdown_rx = self.shutdown_tx.subscribe();
-        let scheduler_shutdown_tx = self.scheduler.get_shutdown_sender();
+        let scheduler_shutdown = self.scheduler.shutdown_handle();
 
-        // Wait for shutdown signal (Ctrl+C or internal)
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                println!("Received shutdown signal, stopping Engine...");
+                println!("Shutdown signal received");
             }
             _ = shutdown_rx.changed() => {
-                println!("Received internal shutdown signal...");
+                println!("Internal shutdown signal received");
             }
         }
 
-        self.set_state(EngineState::Draining);
+        self.set_state(EngineState::Draining).await;
 
-        // Notify scheduler to stop and persist tasks
-        let _ = scheduler_shutdown_tx.send(true);
+        // Send shutdown signals
+        let _ = scheduler_shutdown.send(true);
         let _ = self.shutdown_tx.send(true);
 
-        // Wait briefly to allow pending tasks to complete
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        self.set_state(EngineState::Stopped).await;
 
-        self.set_state(EngineState::Stopped);
-        println!("✅ Engine stopped gracefully.");
+        println!("✅ Engine stopped");
         Ok(())
     }
 
-    /// Schedule a new task into the shared queue
-    pub async fn schedule_task(
-        &self,
-        task: QueueTask,
-    ) -> Result<Uuid, Box<dyn std::error::Error + Send + Sync>> {
-        self.task_queue.enqueue(task.clone()).await?;
+    pub async fn set_state(&self, new_state: EngineState) {
+        let current_state = *self.state.read().await;
+        println!("State changed: {:?} → {:?}", current_state, new_state);
+        *self.state.write().await = new_state;
+    }
+
+    pub async fn get_state(&self) -> EngineState {
+        *self.state.read().await
+    }
+
+    pub async fn schedule_task(&self, task: QueueTask) -> anyhow::Result<Uuid> {
+        // FIXED: Handle the String error properly
+        self.task_queue.enqueue(task.clone()).await
+            .map_err(|e| anyhow::anyhow!("Failed to enqueue task: {}", e))?;
         Ok(task.id)
     }
 
-    /// Dequeue the next available task (priority + scheduled time)
-    pub async fn dequeue_task(&self) -> Option<QueueTask> {
-        self.task_queue.dequeue().await
+    pub async fn cancel_task(&self, id: Uuid) -> bool {
+        self.executor.cancel_task(id).await
     }
 
-    /// Get all pending tasks in the queue
     pub async fn get_pending_tasks(&self) -> Vec<QueueTask> {
         self.task_queue.get_all_pending().await
     }
 
-    /// Print current engine status for debugging
-    pub async fn print_status(&self) {
-        let pending = self.task_queue.len().await;
-        println!("=== Orion Engine Status ===");
-        println!("State: {:?}", self.state);
-        println!("Config: {:?}", self.config);
-        println!("Pending tasks: {}", pending);
-        println!("===========================");
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
     }
 }
