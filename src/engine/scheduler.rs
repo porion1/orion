@@ -14,6 +14,7 @@ pub struct Scheduler {
     queue: Arc<SharedTaskQueue>,
     executor: Arc<TaskExecutor>,
     shutdown_tx: watch::Sender<bool>,
+    shutdown_received: Arc<tokio::sync::RwLock<bool>>, // NEW: Track shutdown state
 }
 
 impl Scheduler {
@@ -28,6 +29,7 @@ impl Scheduler {
             queue,
             executor,
             shutdown_tx,
+            shutdown_received: Arc::new(tokio::sync::RwLock::new(false)), // NEW: Initialize shutdown flag
         }
     }
 
@@ -40,12 +42,23 @@ impl Scheduler {
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
+                    // NEW: Check if shutdown received before processing tasks
+                    if *self.shutdown_received.read().await {
+                        println!("⏸️  Scheduler paused (shutdown received)");
+                        continue;
+                    }
+
                     self.process_ready_tasks().await;
                     self.update_metrics().await;
                 }
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         println!("🛑 Scheduler shutting down");
+
+                        // NEW: Set shutdown flag to stop recurring tasks
+                        *self.shutdown_received.write().await = true;
+                        println!("⏹️  Stopping new recurring task scheduling");
+
                         // FIXED: Handle the Result properly
                         if let Err(e) = self.queue.persist_all().await {
                             eprintln!("⚠️ Failed to persist queue state during shutdown: {}", e);
@@ -56,6 +69,7 @@ impl Scheduler {
             }
         }
 
+        println!("✅ Scheduler stopped");
         Ok(())
     }
 
@@ -90,8 +104,12 @@ impl Scheduler {
         // Handle retry logic
         self.handle_task_result(task_id, &task, &executor, &queue).await;
 
-        // Handle recurring tasks
-        self.handle_recurring_tasks(&task, &queue).await;
+        // Handle recurring tasks - NEW: Check shutdown flag
+        if !*self.shutdown_received.read().await {
+            self.handle_recurring_tasks(&task, &queue).await;
+        } else {
+            println!("⏹️  Skipping recurring task scheduling (shutdown in progress)");
+        }
     }
 
     /// Handle task result and retry logic
@@ -104,6 +122,12 @@ impl Scheduler {
     ) {
         if let Some(result) = executor.get_result(task_id).await {
             if !result.success && task.retry_count < task.max_retries {
+                // NEW: Check shutdown flag before scheduling retry
+                if *self.shutdown_received.read().await {
+                    println!("⏹️  Skipping retry for task {} (shutdown in progress)", task_id);
+                    return;
+                }
+
                 let mut retry = task.clone();
                 retry.retry_count += 1;
                 retry.scheduled_at = SystemTime::now() + Duration::from_secs(5);
@@ -124,6 +148,12 @@ impl Scheduler {
     /// Handle recurring tasks
     async fn handle_recurring_tasks(&self, task: &QueueTask, queue: &Arc<SharedTaskQueue>) {
         if let TaskType::Recurring { .. } = task.task_type {
+            // NEW: Additional check for shutdown (belt and suspenders)
+            if *self.shutdown_received.read().await {
+                println!("⏹️  Skipping recurring task reschedule (shutdown in progress)");
+                return;
+            }
+
             if let Some(next) = Task::from_queue_task(task).create_next_occurrence() {
                 match queue.enqueue((&next).into()).await {
                     Ok(_) => {
@@ -142,10 +172,22 @@ impl Scheduler {
     async fn update_metrics(&self) {
         let pending = self.queue.len().await;
         gauge!("orion.scheduler.tasks_pending", pending as f64);
+
+        // NEW: Also log shutdown state
+        if *self.shutdown_received.read().await {
+            gauge!("orion.scheduler.shutdown_state", 1.0);
+        } else {
+            gauge!("orion.scheduler.shutdown_state", 0.0);
+        }
     }
 
     /// Public API: schedule a task
     pub async fn schedule(&self, task: QueueTask) -> anyhow::Result<Uuid> {
+        // NEW: Check shutdown flag before scheduling new tasks
+        if *self.shutdown_received.read().await {
+            return Err(anyhow::anyhow!("Scheduler is shutting down, cannot schedule new tasks"));
+        }
+
         let id = task.id;
         self.queue.enqueue(task).await?;
         Ok(id)
@@ -154,5 +196,19 @@ impl Scheduler {
     /// Shutdown signal handle
     pub fn shutdown_handle(&self) -> watch::Sender<bool> {
         self.shutdown_tx.clone()
+    }
+
+    // NEW: Check if scheduler is shutting down
+    pub async fn is_shutting_down(&self) -> bool {
+        *self.shutdown_received.read().await
+    }
+
+    // NEW: Get shutdown state for monitoring
+    pub async fn get_shutdown_state(&self) -> String {
+        if *self.shutdown_received.read().await {
+            "shutting_down".to_string()
+        } else {
+            "running".to_string()
+        }
     }
 }

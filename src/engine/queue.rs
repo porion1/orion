@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sled::Db;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
@@ -42,7 +42,20 @@ pub struct QueueTask {
 #[derive(Debug, Clone)]
 pub struct QueueConfig {
     pub max_queue_size: usize,
-    pub persistence_path: Option<String>,
+    persistence_path: Option<String>,
+}
+
+impl QueueConfig {
+    pub fn new(max_queue_size: usize, persistence_path: Option<String>) -> Self {
+        Self {
+            max_queue_size,
+            persistence_path,
+        }
+    }
+
+    pub fn persistence_path(&self) -> Option<&String> {
+        self.persistence_path.as_ref()
+    }
 }
 
 /// --------------------------------
@@ -87,6 +100,7 @@ struct QueueInner {
     medium: BinaryHeap<QueueTaskWrapper>,
     low: BinaryHeap<QueueTaskWrapper>,
     pending_tasks: HashMap<Uuid, QueueTask>,
+    task_ids_in_memory: HashSet<Uuid>, // NEW: Track IDs in memory for duplicate checking
 }
 
 /// --------------------------------
@@ -102,7 +116,7 @@ pub struct SharedTaskQueue {
 impl SharedTaskQueue {
     /// Create a new queue
     pub fn new(config: QueueConfig) -> Self {
-        let db = config.persistence_path.as_ref().map(|path| {
+        let db = config.persistence_path().map(|path| {
             Arc::new(sled::open(path).expect("Failed to open queue DB"))
         });
 
@@ -111,6 +125,7 @@ impl SharedTaskQueue {
             medium: BinaryHeap::new(),
             low: BinaryHeap::new(),
             pending_tasks: HashMap::new(),
+            task_ids_in_memory: HashSet::new(), // NEW: Initialize ID tracker
         };
 
         Self {
@@ -129,7 +144,8 @@ impl SharedTaskQueue {
             return Err(anyhow!("Queue is full (max: {})", self.config.max_queue_size));
         }
 
-        if inner.pending_tasks.contains_key(&task.id) {
+        // FIX: Check both pending_tasks AND task_ids_in_memory
+        if inner.task_ids_in_memory.contains(&task.id) {
             return Err(anyhow!("Task already exists with ID: {}", task.id));
         }
 
@@ -140,7 +156,9 @@ impl SharedTaskQueue {
             TaskPriority::Low => inner.low.push(wrapper),
         }
 
+        // FIX: Insert into both tracking structures
         inner.pending_tasks.insert(task.id, task.clone());
+        inner.task_ids_in_memory.insert(task.id);
 
         counter!("orion.scheduler.tasks_scheduled_total", 1);
         gauge!("orion.scheduler.tasks_pending", inner.pending_tasks.len() as f64);
@@ -176,7 +194,10 @@ impl SharedTaskQueue {
             .or_else(|| pop_ready(&mut inner.medium, now))
             .or_else(|| pop_ready(&mut inner.low, now))?;
 
+        // FIX: Remove from both tracking structures
         inner.pending_tasks.remove(&task_opt.id);
+        inner.task_ids_in_memory.remove(&task_opt.id);
+
         gauge!("orion.scheduler.tasks_pending", inner.pending_tasks.len() as f64);
 
         if let Some(db) = &self.db {
@@ -226,6 +247,12 @@ impl SharedTaskQueue {
         self.len().await == 0
     }
 
+    /// Check if a task ID exists in memory
+    pub async fn contains_task(&self, task_id: &Uuid) -> bool {
+        let inner = self.inner.read().await;
+        inner.task_ids_in_memory.contains(task_id)
+    }
+
     /// Persist all tasks
     pub async fn persist_all(&self) -> Result<()> {
         if let Some(db) = &self.db {
@@ -243,22 +270,75 @@ impl SharedTaskQueue {
     /// Load persisted tasks from DB
     pub async fn load_persisted(&self) -> Result<()> {
         if let Some(db) = &self.db {
+            let mut loaded_count = 0;
+            let mut skipped_count = 0;
+            let mut error_count = 0;
+
             for result in db.iter() {
                 match result {
                     Ok((_key, value)) => {
-                        if let Ok(task) = serde_json::from_slice::<QueueTask>(&value) {
-                            if self.len().await < self.config.max_queue_size {
-                                if let Err(e) = self.enqueue(task).await {
-                                    eprintln!("⚠️ Failed to load persisted task: {}", e);
+                        match serde_json::from_slice::<QueueTask>(&value) {
+                            Ok(task) => {
+                                // FIX: Check if task already exists in memory before enqueueing
+                                if self.contains_task(&task.id).await {
+                                    // Task already in memory, skip it
+                                    skipped_count += 1;
+                                    continue;
                                 }
+
+                                // Check queue size limit
+                                if self.len().await >= self.config.max_queue_size {
+                                    println!("⚠️ Queue full, stopping persistence load");
+                                    break;
+                                }
+
+                                // Enqueue the task
+                                match self.enqueue(task).await {
+                                    Ok(_) => {
+                                        loaded_count += 1;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("⚠️ Failed to load persisted task: {}", e);
+                                        error_count += 1;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("⚠️ Failed to deserialize persisted task: {}", e);
+                                error_count += 1;
                             }
                         }
                     }
                     Err(e) => {
                         eprintln!("⚠️ Error reading from persistence DB: {}", e);
+                        error_count += 1;
                     }
                 }
             }
+
+            println!("📂 Persistence load complete: {} loaded, {} skipped (duplicates), {} errors",
+                     loaded_count, skipped_count, error_count);
+        } else {
+            println!("📂 No persistence configured, skipping load");
+        }
+        Ok(())
+    }
+
+    /// Remove task from persistence (for completed tasks)
+    pub async fn remove_from_persistence(&self, task_id: Uuid) -> Result<()> {
+        if let Some(db) = &self.db {
+            db.remove(task_id.as_bytes())
+                .map_err(|e| anyhow!("Failed to remove task from persistence: {}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Clear all persisted tasks from DB
+    pub async fn clear_persistence(&self) -> Result<()> {
+        if let Some(db) = &self.db {
+            db.clear()
+                .map_err(|e| anyhow!("Failed to clear persistence DB: {}", e))?;
+            println!("🧹 Cleared all persisted tasks");
         }
         Ok(())
     }

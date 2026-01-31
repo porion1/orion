@@ -34,10 +34,10 @@ impl Engine {
         let (shutdown_tx, _) = watch::channel(false);
 
         // Shared task queue
-        let queue_config = QueueConfig {
-            max_queue_size: 10_000,
-            persistence_path: config.persistence_path.clone(),
-        };
+        let queue_config = QueueConfig::new(
+            10_000,
+            config.persistence_path.clone(),
+        );
         let task_queue = Arc::new(SharedTaskQueue::new(queue_config));
 
         // Executor
@@ -66,6 +66,21 @@ impl Engine {
     pub async fn start(self: Arc<Self>) -> anyhow::Result<()> {
         self.set_state(EngineState::Running).await;
         println!("🚀 Engine starting...");
+
+        // Load persisted tasks from storage
+        match self.task_queue.load_persisted().await {
+            Ok(_) => {
+                let pending_count = self.task_queue.len().await;
+                if pending_count > 0 {
+                    println!("📂 Loaded {} persisted tasks from storage", pending_count);
+                } else {
+                    println!("📂 No persisted tasks found in storage");
+                }
+            }
+            Err(e) => {
+                eprintln!("⚠️ Failed to load persisted tasks: {}", e);
+            }
+        }
 
         // Start scheduler first
         let scheduler_clone = Arc::clone(&self.scheduler);
@@ -100,6 +115,9 @@ impl Engine {
         let _ = scheduler_shutdown.send(true);
         let _ = self.shutdown_tx.send(true);
 
+        // NEW: Clean up completed tasks before stopping
+        self.cleanup_completed_tasks().await;
+
         tokio::time::sleep(Duration::from_secs(5)).await;
         self.set_state(EngineState::Stopped).await;
 
@@ -118,7 +136,6 @@ impl Engine {
     }
 
     pub async fn schedule_task(&self, task: QueueTask) -> anyhow::Result<Uuid> {
-        // FIXED: Handle the String error properly
         self.task_queue.enqueue(task.clone()).await
             .map_err(|e| anyhow::anyhow!("Failed to enqueue task: {}", e))?;
         Ok(task.id)
@@ -134,5 +151,66 @@ impl Engine {
 
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
+    }
+
+    // NEW: Clean up completed tasks from persistence
+    pub async fn cleanup_completed_tasks(&self) {
+        println!("🧹 Cleaning up completed tasks from persistence...");
+
+        // Get all results from executor
+        let completed_results = self.executor.get_all_results().await;
+        let mut cleaned_count = 0;
+        let mut error_count = 0;
+
+        for result in completed_results {
+            // Remove task from persistence DB
+            match self.task_queue.remove_from_persistence(result.task_id).await {
+                Ok(_) => {
+                    cleaned_count += 1;
+                }
+                Err(e) => {
+                    eprintln!("⚠️ Failed to remove task {} from persistence: {}",
+                              result.task_id, e);
+                    error_count += 1;
+                }
+            }
+        }
+
+        println!("✅ Cleaned {} completed tasks from persistence ({} errors)",
+                 cleaned_count, error_count);
+    }
+
+    // NEW: Clear all persistence data (useful for testing/demo cleanup)
+    pub async fn clear_persistence(&self) -> anyhow::Result<()> {
+        println!("🧹 Clearing all persistence data...");
+        self.task_queue.clear_persistence().await
+            .map_err(|e| anyhow::anyhow!("Failed to clear persistence: {}", e))?;
+        println!("✅ All persistence data cleared");
+        Ok(())
+    }
+
+    // NEW: Get completed task count from executor
+    pub async fn get_completed_count(&self) -> u64 {
+        self.executor.get_completed_count().await
+    }
+
+    // NEW: Get active task count from executor
+    pub async fn get_active_count(&self) -> usize {
+        self.executor.get_active_count().await
+    }
+
+    // NEW: Get task statistics (pending, active, completed)
+    pub async fn get_task_stats(&self) -> (usize, usize, u64) {
+        let pending = self.task_queue.len().await;
+        let active = self.get_active_count().await;
+        let completed = self.get_completed_count().await;
+        (pending, active, completed)
+    }
+
+    // NEW: Helper method to get task count (pending + completed) - updated
+    pub async fn get_task_count(&self) -> (usize, usize) {
+        let pending = self.task_queue.len().await;
+        let completed = self.executor.get_completed_count().await as usize;
+        (pending, completed)
     }
 }
