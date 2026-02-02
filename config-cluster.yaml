@@ -1,0 +1,17 @@
+scheduler_tick_secs: 1
+max_concurrent_tasks: 100
+logging_level: "info"
+persistence_path: "./orion-data"
+metrics_port: 9000
+metrics_enabled: true
+
+cluster_config:
+  enabled: true
+  node_listen_addr: "0.0.0.0:9090"
+  heartbeat_interval_ms: 5000
+  cluster_peers:
+    - "192.168.1.100:9090"
+    - "192.168.1.101:9090"
+  node_persistence_path: "./orion-nodes"
+  min_health_score: 70.0
+  auto_discovery: true

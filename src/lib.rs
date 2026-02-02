@@ -37,6 +37,7 @@ pub mod network;
 pub mod security;
 pub mod utils;
 pub mod metrics;
+pub mod node;
 
 // Re-export commonly used types
 pub use engine::{
@@ -48,6 +49,11 @@ pub use engine::{
 };
 // TaskType and TaskStatus are in a submodule, so export them separately
 pub use engine::task::{TaskType, TaskStatus};
+
+pub use node::{
+    NodeRegistry, NodeInfo, NodeStatus, HealthScorer,
+    MembershipManager, NodeClassification
+};
 
 // Optional: Create a prelude module for common imports
 pub mod prelude {

@@ -1,0 +1,229 @@
+{
+  "project": {
+    "name": "orion",
+    "version": "0.1.0",
+    "edition": "2021",
+    "authors": ["Rehan"],
+    "description": "Orion – High-performance task orchestration engine in Rust",
+    "license": "MIT",
+    "dependencies": {
+      "tokio": { "version": "1", "features": ["full", "time"] },
+      "serde": { "version": "1.0", "features": ["derive"] },
+      "serde_json": "1.0",
+      "serde_yaml": "0.9",
+      "toml": "0.7",
+      "sled": "0.34",
+      "clap": { "version": "4.2", "features": ["derive"] },
+      "tracing": "0.1",
+      "tracing-subscriber": "0.3",
+      "ring": "0.17",
+      "chrono": "0.4",
+      "cron": "0.12",
+      "uuid": { "version": "1.0", "features": ["v4", "serde"] },
+      "metrics": "0.21",
+      "metrics-exporter-prometheus": "0.12",
+      "anyhow": "1.0.100",
+      "thiserror": "1.0.69",
+      "rand": "0.10.0-rc.8"
+    }
+  },
+  "modules": [
+    {"name": "engine", "path": "src/engine/mod.rs"},
+    {"name": "engine::task", "path": "src/engine/task.rs"},
+    {"name": "engine::queue", "path": "src/engine/queue.rs"},
+    {"name": "engine::executor", "path": "src/engine/executor.rs"},
+    {"name": "cli", "path": "src/cli.rs"},
+    {"name": "metrics", "path": "src/metrics.rs"},
+    {"name": "network", "path": "src/network.rs"},
+    {"name": "security", "path": "src/security.rs"},
+    {"name": "utils", "path": "src/utils.rs"},
+    {"name": "data", "path": "src/data.rs"}
+  ],
+  "types": [
+    {
+      "name": "Task",
+      "module": "engine::task",
+      "fields": {
+        "id": "Uuid",
+        "name": "String",
+        "task_type": "TaskType",
+        "scheduled_at": "SystemTime",
+        "payload": "Option<serde_json::Value>",
+        "status": "TaskStatus",
+        "created_at": "SystemTime",
+        "updated_at": "SystemTime",
+        "retry_count": "u32",
+        "max_retries": "u32",
+        "metadata": "Option<HashMap<String, String>>"
+      },
+      "methods": [
+        "new_one_shot(name: &str, delay: Duration, payload: Option<Value>) -> Task",
+        "new_recurring(name: &str, cron_expr: &str, payload: Option<Value>) -> Result<Task, TaskError>",
+        "create_next_occurrence(&self) -> Option<Task>",
+        "update_status(&mut self, status: TaskStatus)",
+        "from_queue_task(qt: &QueueTask) -> Task",
+        "to_queue_task(&self, priority: TaskPriority) -> QueueTask",
+        "is_ready(&self) -> bool",
+        "delay_until_scheduled(&self) -> Option<Duration>",
+        "can_retry(&self) -> bool"
+      ]
+    },
+    {
+      "name": "Scheduler",
+      "module": "engine",
+      "fields": {
+        "queue": "Arc<SharedTaskQueue>",
+        "executor": "Arc<TaskExecutor>",
+        "shutdown_tx": "watch::Sender<bool>",
+        "shutdown_received": "Arc<RwLock<bool>>"
+      },
+      "methods": [
+        "start(self: Arc<Self>) -> anyhow::Result<()>",
+        "process_ready_tasks(&self)",
+        "dispatch(&self, task: QueueTask)",
+        "handle_task_result(&self, task_id: Uuid, task: &QueueTask, executor: &Arc<TaskExecutor>, queue: &Arc<SharedTaskQueue>)",
+        "handle_recurring_tasks(&self, task: &QueueTask, queue: &Arc<SharedTaskQueue>)",
+        "update_metrics(&self)",
+        "schedule(&self, task: QueueTask) -> anyhow::Result<Uuid>",
+        "shutdown_handle(&self) -> watch::Sender<bool>",
+        "is_shutting_down(&self) -> bool",
+        "get_shutdown_state(&self) -> String"
+      ]
+    },
+    {
+      "name": "Engine",
+      "module": "engine",
+      "fields": {
+        "state": "EngineState",
+        "scheduler": "Arc<Scheduler>",
+        "executor": "Arc<TaskExecutor>",
+        "queue": "Arc<SharedTaskQueue>",
+        "config": "EngineConfig"
+      },
+      "methods": [
+        "new(config: EngineConfig) -> Self",
+        "start(&self) -> anyhow::Result<()>",
+        "schedule_task(&self, task: QueueTask) -> anyhow::Result<Uuid>",
+        "cancel_task(&self, id: Uuid) -> bool",
+        "get_pending_tasks(&self) -> Vec<Task>",
+        "shutdown(&self)"
+      ]
+    }
+  ],
+  "enums": [
+    {
+      "name": "TaskPriority",
+      "variants": ["High", "Medium", "Low"]
+    },
+    {
+      "name": "TaskStatus",
+      "variants": ["Pending", "Running", "Completed", "Failed", "Cancelled"]
+    },
+    {
+      "name": "TaskType",
+      "variants": ["OneShot", {"Recurring": {"cron_expr": "String"}}]
+    },
+    {
+      "name": "EngineState",
+      "variants": ["Init", "Running", "Draining", "Stopped"]
+    },
+    {
+      "name": "QueueTaskError",
+      "variants": ["QueueFull", "PersistenceFailed"]
+    }
+  ],
+  "functions": [
+    {
+      "name": "start_metrics_server",
+      "args": [{"name": "port", "type": "u16"}],
+      "return": "Result<(), Box<dyn std::error::Error>>",
+      "async": false
+    }
+  ],
+  "config": {
+    "scheduler_tick_secs": 1,
+    "max_concurrent_tasks": 100,
+    "logging_level": "info",
+    "persistence_path": "./orion-data",
+    "metrics_port": 9000,
+    "metrics_enabled": true
+  },
+  "metrics": {
+    "counters": [
+      "orion.scheduler.tasks_scheduled_total",
+      "orion.scheduler.tasks_retried_total",
+      "orion.scheduler.tasks_rescheduled_total",
+      "orion.scheduler.tasks_retry_failed_total",
+      "orion.scheduler.tasks_reschedule_failed_total"
+    ],
+    "gauges": [
+      "orion.scheduler.tasks_pending",
+      "orion.scheduler.shutdown_state"
+    ]
+  },
+  "tasks_demo": [
+    {
+      "name": "Immediate Task",
+      "type": "OneShot",
+      "payload": {"action": "immediate", "demo_task": true},
+      "priority": "High",
+      "scheduled_delay_secs": 0
+    },
+    {
+      "name": "Process Data",
+      "type": "OneShot",
+      "payload": {"action": "process", "demo_task": true},
+      "priority": "Medium",
+      "scheduled_delay_secs": 5
+    },
+    {
+      "name": "Health Check",
+      "type": "Recurring",
+      "payload": {"action": "health_check", "demo_task": true, "recurring": true},
+      "priority": "High",
+      "cron": "*/10 * * * * *"
+    },
+    {
+      "name": "HIGH Priority Task",
+      "type": "OneShot",
+      "payload": {"priority": "high", "demo_task": true, "should_succeed": true},
+      "priority": "High",
+      "scheduled_delay_secs": 3
+    },
+    {
+      "name": "MEDIUM Priority Task",
+      "type": "OneShot",
+      "payload": {"priority": "medium", "demo_task": true, "should_succeed": true},
+      "priority": "Medium",
+      "scheduled_delay_secs": 3
+    },
+    {
+      "name": "LOW Priority Task",
+      "type": "OneShot",
+      "payload": {"priority": "low", "demo_task": true, "should_succeed": true},
+      "priority": "Low",
+      "scheduled_delay_secs": 3
+    },
+    {
+      "name": "Timeout Task",
+      "type": "OneShot",
+      "payload": {"action": "timeout_demo", "demo_task": true},
+      "priority": "High",
+      "scheduled_delay_secs": 1
+    },
+    {
+      "name": "To Be Cancelled Task",
+      "type": "OneShot",
+      "payload": {"action": "cancel_demo", "demo_task": true},
+      "priority": "Medium",
+      "scheduled_delay_secs": 4
+    },
+    {
+      "name": "Retry Demo Task",
+      "type": "OneShot",
+      "payload": {"action": "retry_demo", "should_fail": true, "max_retries": 3, "demo_retry": true},
+      "priority": "High",
+      "scheduled_delay_secs": 2
+    }
+  ]
+}

@@ -27,3 +27,19 @@ metrics-exporter-prometheus = "0.12"
 anyhow = "1.0.100"
 thiserror = "1.0.69"
 rand = "0.10.0-rc.8"
+
+# Node Manager dependencies - FIXED VERSIONS
+dashmap = "5.5"  # Changed from 7.0.0-rc2 to stable version
+bincode = "1.3"  # Changed from 3.0.0 to stable version
+
+# Add these Node Manager dependencies:
+flume = "0.11"
+crossbeam = "0.8"
+parking_lot = "0.12"
+lru = "0.12"
+quick-error = "2.0"
+rcgen = "0.12"
+rustls = "0.22"
+rustls-pemfile = "2.1"
+tracing-appender = "0.2"
+tracing-bunyan-formatter = "0.3"

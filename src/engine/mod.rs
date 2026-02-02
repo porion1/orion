@@ -1,5 +1,4 @@
 pub mod config;
-pub mod node;
 pub mod scheduler;
 pub mod state;
 pub mod task;
@@ -27,6 +26,9 @@ pub struct Engine {
     pub state: Arc<RwLock<EngineState>>,
     pub task_queue: Arc<SharedTaskQueue>,
     shutdown_tx: watch::Sender<bool>,
+
+    // NEW: Node Manager (optional - only initialized if cluster is enabled)
+    pub node_manager: Option<Arc<crate::node::NodeManager>>,
 }
 
 impl Engine {
@@ -53,6 +55,26 @@ impl Engine {
             Arc::clone(&executor),
         ));
 
+        // NEW: Initialize Node Manager only if cluster is enabled
+        let node_manager = if config.is_cluster_enabled() {
+            // Get the cluster config and convert it to NodeConfig using the From trait
+            let cluster_config = config.cluster_config.as_ref().unwrap();
+            let node_config: crate::node::NodeConfig = cluster_config.clone().into();
+
+            match crate::node::NodeManager::new(node_config) {
+                Ok(manager) => {
+                    println!("🌐 Node Manager initialized");
+                    Some(Arc::new(manager))
+                }
+                Err(e) => {
+                    eprintln!("⚠️ Failed to initialize Node Manager: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             scheduler,
             executor,
@@ -60,12 +82,22 @@ impl Engine {
             state: Arc::new(RwLock::new(EngineState::Init)),
             task_queue,
             shutdown_tx,
+            node_manager,
         }
     }
 
     pub async fn start(self: Arc<Self>) -> anyhow::Result<()> {
         self.set_state(EngineState::Running).await;
         println!("🚀 Engine starting...");
+
+        // NEW: Start Node Manager if enabled
+        if let Some(node_manager) = &self.node_manager {
+            if let Err(e) = node_manager.start() {
+                eprintln!("⚠️ Failed to start Node Manager: {}", e);
+            } else {
+                println!("🌐 Node Manager started");
+            }
+        }
 
         // Load persisted tasks from storage
         match self.task_queue.load_persisted().await {
@@ -111,11 +143,17 @@ impl Engine {
 
         self.set_state(EngineState::Draining).await;
 
+        // NEW: Stop Node Manager if enabled
+        if let Some(node_manager) = &self.node_manager {
+            node_manager.stop();
+            println!("🌐 Node Manager stopped");
+        }
+
         // Send shutdown signals
         let _ = scheduler_shutdown.send(true);
         let _ = self.shutdown_tx.send(true);
 
-        // NEW: Clean up completed tasks before stopping
+        // Clean up completed tasks before stopping
         self.cleanup_completed_tasks().await;
 
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -136,6 +174,15 @@ impl Engine {
     }
 
     pub async fn schedule_task(&self, task: QueueTask) -> anyhow::Result<Uuid> {
+        // NEW: Node-aware scheduling if Node Manager is enabled
+        if let Some(node_manager) = &self.node_manager {
+            // Check if we should distribute this task to other nodes
+            if self.should_distribute_task(&task) {
+                return self.distribute_task_to_node(task).await;
+            }
+        }
+
+        // Original scheduling logic (unchanged)
         self.task_queue.enqueue(task.clone()).await
             .map_err(|e| anyhow::anyhow!("Failed to enqueue task: {}", e))?;
         Ok(task.id)
@@ -153,7 +200,6 @@ impl Engine {
         let _ = self.shutdown_tx.send(true);
     }
 
-    // NEW: Clean up completed tasks from persistence
     pub async fn cleanup_completed_tasks(&self) {
         println!("🧹 Cleaning up completed tasks from persistence...");
 
@@ -180,7 +226,6 @@ impl Engine {
                  cleaned_count, error_count);
     }
 
-    // NEW: Clear all persistence data (useful for testing/demo cleanup)
     pub async fn clear_persistence(&self) -> anyhow::Result<()> {
         println!("🧹 Clearing all persistence data...");
         self.task_queue.clear_persistence().await
@@ -189,17 +234,14 @@ impl Engine {
         Ok(())
     }
 
-    // NEW: Get completed task count from executor
     pub async fn get_completed_count(&self) -> u64 {
         self.executor.get_completed_count().await
     }
 
-    // NEW: Get active task count from executor
     pub async fn get_active_count(&self) -> usize {
         self.executor.get_active_count().await
     }
 
-    // NEW: Get task statistics (pending, active, completed)
     pub async fn get_task_stats(&self) -> (usize, usize, u64) {
         let pending = self.task_queue.len().await;
         let active = self.get_active_count().await;
@@ -207,10 +249,65 @@ impl Engine {
         (pending, active, completed)
     }
 
-    // NEW: Helper method to get task count (pending + completed) - updated
     pub async fn get_task_count(&self) -> (usize, usize) {
         let pending = self.task_queue.len().await;
         let completed = self.executor.get_completed_count().await as usize;
         (pending, completed)
+    }
+
+    // NEW: Helper method to determine if task should be distributed
+    fn should_distribute_task(&self, task: &QueueTask) -> bool {
+        // Simple heuristic: distribute high priority or resource-intensive tasks
+        task.priority == TaskPriority::High ||
+            task.payload.as_ref().map_or(false, |p|
+                p.as_object().map_or(false, |obj|
+                    obj.contains_key("distribute") && obj["distribute"].as_bool().unwrap_or(false)
+                )
+            )
+    }
+
+    // NEW: Distribute task to best available node
+    async fn distribute_task_to_node(&self, task: QueueTask) -> anyhow::Result<Uuid> {
+        if let Some(_node_manager) = &self.node_manager {
+            // Get healthy nodes
+            let healthy_nodes = _node_manager.health_scorer().get_healthy_nodes(70.0);
+
+            if healthy_nodes.is_empty() {
+                // No healthy remote nodes, fall back to local
+                return self.task_queue.enqueue(task.clone()).await
+                    .map_err(|e| anyhow::anyhow!("Failed to enqueue task locally: {}", e))
+                    .map(|_| task.id);
+            }
+
+            // TODO: Implement actual task distribution logic
+            // For now, just log and schedule locally
+            println!("🌐 Would distribute task {} to {} healthy node(s)", task.id, healthy_nodes.len());
+        }
+
+        // Fallback to local scheduling
+        self.task_queue.enqueue(task.clone()).await
+            .map_err(|e| anyhow::anyhow!("Failed to enqueue task: {}", e))?;
+        Ok(task.id)
+    }
+
+    // NEW: Get cluster information if Node Manager is enabled
+    pub async fn get_cluster_info(&self) -> Option<crate::node::ClusterInfo> {
+        self.node_manager.as_ref().map(|nm| {
+            nm.membership_manager().get_cluster_info()
+        })
+    }
+
+    // NEW: Get node health information
+    pub async fn get_node_health(&self) -> Option<Vec<crate::node::HealthScore>> {
+        self.node_manager.as_ref().map(|nm| {
+            nm.health_scorer().get_all_scores()
+        })
+    }
+
+    // NEW: Get node registry information
+    pub async fn get_nodes(&self) -> Option<Vec<crate::node::NodeInfo>> {
+        self.node_manager.as_ref().map(|nm| {
+            nm.registry().get_all_nodes()
+        })
     }
 }
