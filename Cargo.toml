@@ -23,10 +23,13 @@ chrono = "0.4"
 cron = "0.12"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 metrics = "0.21"
+metrics-util = "0.6"
 metrics-exporter-prometheus = "0.12"
 anyhow = "1.0.100"
 thiserror = "1.0.69"
 rand = "0.10.0-rc.8"
+
+config = "0.13"
 
 # Node Manager dependencies - FIXED VERSIONS
 dashmap = "5.5"  # Changed from 7.0.0-rc2 to stable version
@@ -43,3 +46,4 @@ rustls = "0.22"
 rustls-pemfile = "2.1"
 tracing-appender = "0.2"
 tracing-bunyan-formatter = "0.3"
+async-trait = "0.1.89"

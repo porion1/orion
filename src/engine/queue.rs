@@ -5,6 +5,7 @@ use serde_json::Value;
 use sled::Db;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
@@ -19,6 +20,20 @@ pub enum TaskPriority {
     High = 3,
     Medium = 2,
     Low = 1,
+}
+
+// Add FromStr implementation for TaskPriority
+impl FromStr for TaskPriority {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "high" => Ok(TaskPriority::High),
+            "medium" => Ok(TaskPriority::Medium),
+            "low" => Ok(TaskPriority::Low),
+            _ => Err(format!("Invalid priority: {}", s)),
+        }
+    }
 }
 
 /// --------------------------------

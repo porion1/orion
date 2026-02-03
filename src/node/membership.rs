@@ -80,6 +80,7 @@ pub struct MembershipManager {
     event_sender: flume::Sender<MembershipEvent>,
     event_receiver: flume::Receiver<MembershipEvent>,
     config: MembershipConfig,
+    local_node_id: Option<Uuid>,
 }
 
 impl MembershipManager {
@@ -89,6 +90,7 @@ impl MembershipManager {
         config: MembershipConfig,
     ) -> Self {
         let (event_sender, event_receiver) = flume::unbounded();
+        let local_node_id = registry.local_node().map(|node| node.id);
 
         Self {
             registry,
@@ -96,6 +98,7 @@ impl MembershipManager {
             event_sender,
             event_receiver,
             config,
+            local_node_id,
         }
     }
 
@@ -287,6 +290,88 @@ impl MembershipManager {
             healthy_nodes: healthy_nodes.len(),
             unhealthy_nodes: nodes.len() - healthy_nodes.len(),
             is_healthy: healthy_nodes.len() >= self.config.min_healthy_nodes,
+        }
+    }
+
+    /// Get cluster peers (all nodes except the local node)
+    pub fn get_cluster_peers(&self) -> Vec<Uuid> {
+        let active_nodes = self.registry.get_active_nodes();
+
+        active_nodes
+            .iter()
+            .filter_map(|node| {
+                // Exclude the local node if we have a local node ID
+                if let Some(local_id) = self.local_node_id {
+                    if node.id == local_id {
+                        return None;
+                    }
+                }
+                Some(node.id)
+            })
+            .collect()
+    }
+
+    /// Get cluster peers with detailed information
+    pub fn get_cluster_peers_detailed(&self) -> Vec<crate::node::registry::NodeInfo> {
+        let active_nodes = self.registry.get_active_nodes();
+
+        active_nodes
+            .into_iter()
+            .filter(|node| {
+                // Exclude the local node if we have a local node ID
+                if let Some(local_id) = self.local_node_id {
+                    node.id != local_id
+                } else {
+                    true
+                }
+            })
+            .collect()
+    }
+
+    /// Get healthy cluster peers (above minimum health threshold)
+    pub fn get_healthy_cluster_peers(&self, min_health_score: f64) -> Vec<Uuid> {
+        let healthy_nodes = self.health_scorer.get_healthy_nodes(min_health_score);
+
+        healthy_nodes
+            .into_iter()
+            .filter(|node_id| {
+                // Exclude the local node if we have a local node ID
+                if let Some(local_id) = self.local_node_id {
+                    *node_id != local_id
+                } else {
+                    true
+                }
+            })
+            .collect()
+    }
+
+    /// Set the local node ID (should be called after node registration)
+    pub fn set_local_node_id(&mut self, node_id: Uuid) {
+        self.local_node_id = Some(node_id);
+    }
+
+    /// Get the local node ID
+    pub fn get_local_node_id(&self) -> Option<Uuid> {
+        self.local_node_id
+    }
+
+    /// Check if a specific node is a peer (not the local node)
+    pub fn is_peer_node(&self, node_id: &Uuid) -> bool {
+        match self.local_node_id {
+            Some(local_id) => node_id != &local_id,
+            None => true, // If we don't know our own ID, consider everyone a peer
+        }
+    }
+
+    /// Get number of peer nodes in the cluster
+    pub fn get_peer_count(&self) -> usize {
+        let active_nodes = self.registry.get_active_nodes().len();
+
+        // If we have a local node ID, subtract 1 (the local node)
+        if self.local_node_id.is_some() && active_nodes > 0 {
+            active_nodes - 1
+        } else {
+            active_nodes
         }
     }
 }
