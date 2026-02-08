@@ -4,23 +4,31 @@ pub mod state;
 pub mod task;
 pub mod queue;
 pub mod executor;
-
-// NEW: Add distribution module
 pub mod distribution;
 
+// Import routing module from crate root
+pub use crate::routing;
+use crate::engine::task::ResourceRequirements;
 pub use config::EngineConfig;
 pub use scheduler::Scheduler;
 pub use state::EngineState;
 pub use task::Task;
 pub use queue::{QueueTask, SharedTaskQueue, QueueConfig, TaskPriority};
 pub use executor::TaskExecutor;
-// NEW: Export distribution types
 pub use distribution::{
     NodeAwareDistributor, AssignmentDecision, TaskRequirements,
     ScoringWeights, DistributionError, AffinityRuleEngine,
-    DistributionStats, ResourceRequirements, DistributedTaskFactory,
+    DistributionStats, DistributedTaskFactory,
     NodeMessage, RemoteTaskState, RemoteTaskStatus, TaskResult,
-    SerializedTask, NodeTransport
+    SerializedTask, NodeTransport, DistributedTaskTracker
+};
+
+// Re-export routing types
+pub use crate::routing::{
+    Router, RouterConfig, RoutingStrategy, RoundRobinStrategy,
+    LeastLoadedStrategy, LatencyAwareStrategy, FailoverStrategy,
+    HybridStrategy, NodeMetrics, NodeCapacity, RoutingContext,
+    TaskAdapter, TaskRouterIntegrator
 };
 
 use std::sync::Arc;
@@ -28,6 +36,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 use uuid::Uuid;
 use anyhow::Result;
+use std::collections::HashMap;
 
 /// Main Engine struct
 #[derive(Debug)]
@@ -42,8 +51,15 @@ pub struct Engine {
     // Node Manager (optional - only initialized if cluster is enabled)
     pub node_manager: Option<Arc<crate::node::NodeManager>>,
 
-    // NEW: Node-Aware Distributor
+    // Node-Aware Distributor
     pub distributor: Option<Arc<NodeAwareDistributor>>,
+
+    // Router for load balancing
+    pub router: Option<Arc<Router>>,
+    pub task_router_integrator: Option<Arc<TaskRouterIntegrator>>,
+
+    // Routing configuration
+    pub routing_config: Option<RouterConfig>,
 }
 
 impl Engine {
@@ -70,41 +86,9 @@ impl Engine {
             Arc::clone(&executor),
         ));
 
-        // Initialize Node Manager and Distributor if cluster is enabled
-        let (node_manager, distributor) = if config.is_cluster_enabled() {
-            // Get the cluster config and convert it to NodeConfig
-            if let Some(cluster_config) = &config.cluster_config {
-                let node_config: crate::node::NodeConfig = cluster_config.clone().into();
-
-                match crate::node::NodeManager::new(node_config) {
-                    Ok(manager) => {
-                        let manager_arc = Arc::new(manager);
-
-                        // Create distributor
-                        let distributor = match NodeAwareDistributor::new(manager_arc.clone()) {
-                            Ok(dist) => {
-                                println!("🌐 Node Manager and Distributor initialized");
-                                Some(Arc::new(dist))
-                            }
-                            Err(e) => {
-                                eprintln!("⚠️ Failed to initialize Distributor: {}", e);
-                                None
-                            }
-                        };
-
-                        (Some(manager_arc), distributor)
-                    }
-                    Err(e) => {
-                        eprintln!("⚠️ Failed to initialize Node Manager: {}", e);
-                        (None, None)
-                    }
-                }
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
-        };
+        // Initialize components based on configuration
+        let (node_manager, distributor, router, task_router_integrator, routing_config) =
+            Self::initialize_components(&config);
 
         Self {
             scheduler,
@@ -115,12 +99,95 @@ impl Engine {
             shutdown_tx,
             node_manager,
             distributor,
+            router,
+            task_router_integrator,
+            routing_config,
         }
+    }
+
+    /// Initialize all components based on configuration
+    fn initialize_components(config: &EngineConfig) -> (
+        Option<Arc<crate::node::NodeManager>>,
+        Option<Arc<NodeAwareDistributor>>,
+        Option<Arc<Router>>,
+        Option<Arc<TaskRouterIntegrator>>,
+        Option<RouterConfig>
+    ) {
+        let mut node_manager = None;
+        let mut distributor = None;
+        let mut router = None;
+        let mut task_router_integrator = None;
+        // FIXED: Use None for now since routing_config doesn't exist in EngineConfig
+        let routing_config = None;
+
+        // Initialize if cluster is enabled
+        if config.is_cluster_enabled() {
+            if let Some(cluster_config) = &config.cluster_config {
+                let node_config: crate::node::NodeConfig = cluster_config.clone().into();
+
+                // Initialize Node Manager
+                match crate::node::NodeManager::new(node_config) {
+                    Ok(manager) => {
+                        let manager_arc = Arc::new(manager);
+                        node_manager = Some(Arc::clone(&manager_arc));
+
+                        // Initialize Distributor
+                        match NodeAwareDistributor::new(Arc::clone(&manager_arc), None) {
+                            Ok(dist) => {
+                                println!("🌐 Node Manager and Distributor initialized");
+                                distributor = Some(Arc::new(dist));
+                            }
+                            Err(e) => {
+                                eprintln!("⚠️ Failed to initialize Distributor: {}", e);
+                            }
+                        }
+
+                        // Initialize Router if routing config exists
+                        if let Some(ref router_config) = routing_config {
+                            match Self::initialize_router(router_config) {
+                                Ok((r, i)) => {
+                                    router = Some(r);
+                                    task_router_integrator = Some(i);
+                                    println!("📡 Router initialized with strategy: {}",
+                                             router_config.default_strategy);
+                                }
+                                Err(e) => {
+                                    eprintln!("⚠️ Failed to initialize Router: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️ Failed to initialize Node Manager: {}", e);
+                    }
+                }
+            }
+        }
+
+        (node_manager, distributor, router, task_router_integrator, routing_config)
+    }
+
+    /// Initialize router with strategies
+    fn initialize_router(config: &RouterConfig) -> Result<(Arc<Router>, Arc<TaskRouterIntegrator>)> {
+        let router = Arc::new(Router::new(config.clone()));
+        let integrator = Arc::new(TaskRouterIntegrator::new());
+
+        // Note: Strategies will be initialized when router starts
+        // This is done asynchronously in start() method
+
+        Ok((router, integrator))
     }
 
     pub async fn start(self: Arc<Self>) -> Result<()> {
         self.set_state(EngineState::Running).await;
         println!("🚀 Engine starting...");
+
+        // Initialize routing strategies if router exists
+        if let Some(router) = &self.router {
+            if let Some(config) = &self.routing_config {
+                self.initialize_routing_strategies(router, config).await;
+            }
+        }
 
         // Start Node Manager and Distributor if enabled
         if let Some(node_manager) = &self.node_manager {
@@ -172,7 +239,7 @@ impl Engine {
             println!("🌐 Node monitoring started");
         }
 
-        // NEW: Start remote task monitoring if distribution is enabled
+        // Start remote task monitoring if distribution is enabled
         if self.is_distribution_enabled() {
             let engine_clone = Arc::clone(&self);
             let _remote_monitor_handle = tokio::spawn(async move {
@@ -180,7 +247,7 @@ impl Engine {
             });
             println!("📡 Remote task monitoring started");
 
-            // NEW: Start message receiver if distribution is enabled
+            // Start message receiver if distribution is enabled
             let engine_clone = Arc::clone(&self);
             let _message_receiver_handle = tokio::spawn(async move {
                 engine_clone.receive_messages().await;
@@ -223,6 +290,46 @@ impl Engine {
         Ok(())
     }
 
+    /// Initialize routing strategies
+    async fn initialize_routing_strategies(&self, router: &Arc<Router>, config: &RouterConfig) {
+        let mut strategies = router.strategies.write().await;
+
+        // Add Round Robin strategy
+        strategies.insert(
+            "round_robin".to_string(),
+            Box::new(RoundRobinStrategy::new()),
+        );
+
+        // Add Least Loaded strategy
+        strategies.insert(
+            "least_loaded".to_string(),
+            Box::new(LeastLoadedStrategy::new(config.clone())),
+        );
+
+        // Add Latency Aware strategy
+        strategies.insert(
+            "latency_aware".to_string(),
+            Box::new(LatencyAwareStrategy::new(config.clone())),
+        );
+
+        // Add Failover strategy
+        strategies.insert(
+            "failover".to_string(),
+            Box::new(FailoverStrategy::new(
+                config.clone(),
+                Arc::clone(&router.failover_handler),
+            )),
+        );
+
+        // Add Hybrid strategy
+        strategies.insert(
+            "hybrid".to_string(),
+            Box::new(HybridStrategy::new(config.clone())),
+        );
+
+        println!("🎯 Routing strategies initialized: round_robin, least_loaded, latency_aware, failover, hybrid");
+    }
+
     pub async fn set_state(&self, new_state: EngineState) {
         let current_state = *self.state.read().await;
         println!("State changed: {:?} → {:?}", current_state, new_state);
@@ -233,18 +340,40 @@ impl Engine {
         *self.state.read().await
     }
 
-    /// Schedule a task with node-aware distribution
+    /// Schedule a task
     pub async fn schedule_task(&self, task: QueueTask) -> Result<Uuid> {
         // Check if task should be distributed
         if let Some(distributor) = &self.distributor {
-            // Check if task has distribution requirements
             if Self::should_distribute_task(&task) {
-                return self.schedule_task_with_distribution(distributor, task).await;
+                return self.schedule_with_intelligent_routing(distributor, task).await;
             }
         }
 
         // Fall back to local-only scheduling
         self.schedule_task_locally(task).await
+    }
+
+    /// Intelligent routing that tries multiple approaches
+    async fn schedule_with_intelligent_routing(
+        &self,
+        distributor: &Arc<NodeAwareDistributor>,
+        task: QueueTask
+    ) -> Result<Uuid> {
+        let task_obj = Task::from_queue_task(&task);
+
+        // Try routing first if available
+        if let Some((integrator, router)) = self.get_routing_components() {
+            match self.route_task_with_router(integrator, router, &task_obj, &task).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    println!("⚠️ Router failed: {}, falling back to distributor", e);
+                    // Continue to distributor fallback
+                }
+            }
+        }
+
+        // Fall back to distributor logic
+        self.schedule_with_distributor(distributor, task_obj, task).await
     }
 
     /// Determine if task should be distributed
@@ -269,76 +398,195 @@ impl Engine {
         false
     }
 
-    /// Schedule a task using node-aware distribution
-    async fn schedule_task_with_distribution(
+    /// Get routing components if available
+    fn get_routing_components(&self) -> Option<(&Arc<TaskRouterIntegrator>, &Arc<Router>)> {
+        if let (Some(integrator), Some(router)) = (&self.task_router_integrator, &self.router) {
+            Some((integrator, router))
+        } else {
+            None
+        }
+    }
+
+    /// Route task using router
+    async fn route_task_with_router(
+        &self,
+        integrator: &Arc<TaskRouterIntegrator>,
+        router: &Arc<Router>,
+        task_obj: &Task,
+        original_queue_task: &QueueTask,
+    ) -> Result<Uuid> {
+        println!("🚦 Using router for task '{}'", task_obj.name);
+
+        // Get available nodes
+        let available_nodes = match self.get_available_nodes().await {
+            Some(nodes) if !nodes.is_empty() => nodes,
+            _ => return Err(anyhow::anyhow!("No nodes available for routing")),
+        };
+
+        // Convert to routing format
+        let routing_task = crate::routing::Task::from_engine_task(task_obj);
+        let routing_nodes: Vec<_> = available_nodes.into_iter()
+            .map(Self::convert_to_routing_node)
+            .collect();
+
+        // Use router to select node
+        match integrator.route_orion_task(&routing_task, &routing_nodes, router).await {
+            Ok(selected_node_id) => {
+                println!("📍 Router selected node: {} for task: {}", selected_node_id, task_obj.name);
+
+                // Check if it's local node
+                if self.is_local_node(&selected_node_id).await {
+                    println!("📌 Task '{}' assigned to local execution", task_obj.name);
+                    return self.schedule_task_locally(original_queue_task.clone()).await;
+                }
+
+                // Execute remotely
+                self.execute_on_remote_node_by_id(task_obj, &selected_node_id).await
+            }
+            Err(e) => Err(anyhow::anyhow!("Router failed: {}", e)),
+        }
+    }
+
+    /// Get available nodes from node manager
+    async fn get_available_nodes(&self) -> Option<Vec<crate::node::NodeInfo>> {
+        self.node_manager
+            .as_ref()
+            .and_then(|nm| Some(nm.registry().get_all_nodes()))
+    }
+
+    /// Check if node is local
+    async fn is_local_node(&self, node_id: &str) -> bool {
+        self.get_local_node_info().await
+            .map(|local_node| local_node.id.to_string() == node_id)
+            .unwrap_or(false)
+    }
+
+    /// Execute task on remote node by node ID string
+    async fn execute_on_remote_node_by_id(&self, task: &Task, node_id: &str) -> Result<Uuid> {
+        match Uuid::parse_str(node_id) {
+            Ok(node_uuid) => self.execute_on_remote_node(task, node_uuid).await,
+            Err(_) => {
+                println!("⚠️ Invalid node ID format: {}", node_id);
+                Err(anyhow::anyhow!("Invalid node ID format"))
+            }
+        }
+    }
+
+    /// Convert NodeInfo to routing::Node
+    fn convert_to_routing_node(node_info: crate::node::NodeInfo) -> crate::routing::Node {
+        // Get node tags from capabilities
+        let mut tags = HashMap::new();
+
+        // Add capabilities as tags
+        if node_info.capabilities.cpu_cores >= 4 {
+            tags.insert("high_cpu".to_string(), "true".to_string());
+        }
+        if node_info.capabilities.memory_mb >= 8192 {
+            tags.insert("high_memory".to_string(), "true".to_string());
+        }
+
+        // Add supported task types
+        if !node_info.capabilities.supported_task_types.is_empty() {
+            tags.insert(
+                "supported_task_types".to_string(),
+                node_info.capabilities.supported_task_types.join(",")
+            );
+        }
+
+        // Create NodeMetrics
+        let metrics = NodeMetrics {
+            cpu_usage: 0.5, // TODO: Get actual CPU usage
+            memory_usage: 0.5, // TODO: Get actual memory usage
+            queue_length: 0,
+            processing_tasks: 0,
+            avg_latency_ms: 0.0,
+            last_heartbeat: crate::routing::SerializableInstant::now(),
+            is_healthy: node_info.status == crate::node::NodeStatus::Active,
+            capacity: NodeCapacity {
+                max_concurrent_tasks: node_info.capabilities.max_concurrent_tasks as usize,
+                max_queue_length: 100,
+                supported_task_types: node_info.capabilities.supported_task_types.clone(),
+                regions: vec!["default".to_string()],
+            },
+            tags,
+        };
+
+        crate::routing::Node {
+            id: node_info.id.to_string(),
+            is_healthy: node_info.status == crate::node::NodeStatus::Active,
+            metrics,
+        }
+    }
+
+    /// Schedule using distributor (original logic)
+    async fn schedule_with_distributor(
         &self,
         distributor: &Arc<NodeAwareDistributor>,
-        task: QueueTask
+        task_obj: Task,
+        queue_task: QueueTask
     ) -> Result<Uuid> {
-        // Convert QueueTask to Task for distribution analysis
-        let task_obj = Task::from_queue_task(&task);
-
-        // Get distribution decision
         match distributor.assign_task(&task_obj).await {
             Ok(decision) => {
                 match decision {
                     AssignmentDecision::LocalExecution { node_id } => {
-                        println!("📌 Task '{}' assigned to local node: {}", task.name, node_id);
-                        self.schedule_task_locally(task).await
+                        println!("📌 Task '{}' assigned to local node: {}", queue_task.name, node_id);
+                        self.schedule_task_locally(queue_task).await
                     }
                     AssignmentDecision::RemoteExecution { node_id, estimated_latency, cost } => {
                         println!("🌐 Task '{}' assigned to remote node: {} (latency: {:.2}ms, cost: {:.2})",
-                                 task.name, node_id, estimated_latency, cost);
+                                 queue_task.name, node_id, estimated_latency, cost);
 
-                        // FIXED: Actually execute the task remotely
                         match distributor.execute_remote_task(&task_obj, node_id).await {
                             Ok(task_id) => {
-                                println!("✅ Remote task '{}' dispatched to node {}", task.name, node_id);
-
-                                // Register callback to track remote task completion
-                                let task_name = task.name.clone();
-                                let _task_id_copy = task_obj.id;  // Prefix with underscore
-
-                                distributor.get_task_tracker().register_callback(task_obj.id, move |state| {
-                                    let task_name = task_name.clone();
-                                    if let RemoteTaskStatus::Completed = state.status {
-                                        println!("✅ Remote task '{}' completed on node {}", task_name, state.node_id);
-                                        // Could add result processing here
-                                    } else if let RemoteTaskStatus::Failed(ref error) = state.status {
-                                        println!("❌ Remote task '{}' failed on node {}: {}", task_name, state.node_id, error);
-                                        // Could add retry logic here
-                                    }
-                                }).await;
-
+                                println!("✅ Remote task '{}' dispatched to node {}", queue_task.name, node_id);
+                                self.register_remote_task_callback(&queue_task.name, task_obj.id, distributor).await;
                                 Ok(task_id)
                             }
                             Err(e) => {
                                 println!("⚠️ Failed to execute task '{}' remotely: {}, falling back to local",
-                                         task.name, e);
-                                self.schedule_task_locally(task).await
+                                         queue_task.name, e);
+                                self.schedule_task_locally(queue_task).await
                             }
                         }
                     }
                     AssignmentDecision::NoSuitableNode { reason } => {
-                        println!("⚠️ No suitable node for task '{}': {}", task.name, reason);
-
-                        // Try to schedule locally as fallback
-                        println!("📌 Fallback: Scheduling '{}' locally", task.name);
-                        self.schedule_task_locally(task).await
+                        println!("⚠️ No suitable node for task '{}': {}", queue_task.name, reason);
+                        println!("📌 Fallback: Scheduling '{}' locally", queue_task.name);
+                        self.schedule_task_locally(queue_task).await
                     }
                 }
             }
             Err(e) => {
                 println!("⚠️ Distribution failed for task '{}': {}, falling back to local",
-                         task.name, e);
-
-                // Fall back to local execution
-                self.schedule_task_locally(task).await
+                         queue_task.name, e);
+                self.schedule_task_locally(queue_task).await
             }
         }
     }
 
-    /// Schedule a task locally (original logic)
+    /// Register callback for remote task completion
+    async fn register_remote_task_callback(
+        &self,
+        task_name: &str,
+        task_id: Uuid,
+        distributor: &Arc<NodeAwareDistributor>
+    ) {
+        let task_name = task_name.to_string();
+        distributor.get_task_tracker().register_callback(task_id, move |state| {
+            let task_name = task_name.clone();
+            match state.status {
+                RemoteTaskStatus::Completed => {
+                    println!("✅ Remote task '{}' completed on node {}", task_name, state.node_id);
+                }
+                RemoteTaskStatus::Failed(ref error) => {
+                    println!("❌ Remote task '{}' failed on node {}: {}", task_name, state.node_id, error);
+                }
+                _ => {} // Ignore other statuses
+            }
+        }).await;
+    }
+
+    /// Schedule a task locally
     async fn schedule_task_locally(&self, task: QueueTask) -> Result<Uuid> {
         self.task_queue.enqueue(task.clone()).await
             .map_err(|e| anyhow::anyhow!("Failed to enqueue task: {}", e))?;
@@ -351,12 +599,11 @@ impl Engine {
         task: QueueTask,
         distribution_options: DistributionOptions
     ) -> Result<Uuid> {
-        // Apply distribution options to task
         let task_with_options = apply_distribution_options_to_task(task, distribution_options);
         self.schedule_task(task_with_options).await
     }
 
-    /// NEW: Execute a task on a specific remote node
+    /// Execute a task on a specific remote node
     pub async fn execute_on_remote_node(&self, task: &Task, node_id: Uuid) -> Result<Uuid> {
         if let Some(distributor) = &self.distributor {
             distributor.execute_remote_task(task, node_id)
@@ -367,28 +614,31 @@ impl Engine {
         }
     }
 
-    /// NEW: Get status of remote tasks
+    /// Get status of remote tasks - FIXED: Changed return type from RemoteTaskState to Option<RemoteTaskState>
     pub async fn get_remote_task_status(&self, task_id: Uuid) -> Option<RemoteTaskState> {
         if let Some(distributor) = &self.distributor {
-            distributor.get_task_tracker().get_task_state(task_id).await
+            let task_tracker = distributor.get_task_tracker();
+            task_tracker.get_task_state(task_id).await
         } else {
             None
         }
     }
 
-    /// NEW: Get all remote tasks
+    /// Get all remote tasks
     pub async fn get_all_remote_tasks(&self) -> Vec<RemoteTaskState> {
         if let Some(distributor) = &self.distributor {
-            distributor.get_task_tracker().get_all_remote_tasks().await
+            let task_tracker = distributor.get_task_tracker();
+            task_tracker.get_all_remote_tasks().await
         } else {
             Vec::new()
         }
     }
 
-    /// NEW: Get remote task result
+    /// Get remote task result - FIXED: Changed return type from TaskResult to Option<TaskResult>
     pub async fn get_remote_task_result(&self, task_id: Uuid) -> Option<TaskResult> {
         if let Some(distributor) = &self.distributor {
-            distributor.get_task_tracker().get_task_result(task_id).await
+            let task_tracker = distributor.get_task_tracker();
+            task_tracker.get_task_result(task_id).await
         } else {
             None
         }
@@ -397,9 +647,10 @@ impl Engine {
     pub async fn cancel_task(&self, id: Uuid) -> bool {
         // First check if it's a remote task
         if let Some(distributor) = &self.distributor {
-            if let Some(state) = distributor.get_task_tracker().get_task_state(id).await {
+            let task_tracker = distributor.get_task_tracker();
+            let state = task_tracker.get_task_state(id).await;
+            if let Some(state) = state {
                 if matches!(state.status, RemoteTaskStatus::Pending | RemoteTaskStatus::Running) {
-                    // Send cancellation message to remote node
                     let message = NodeMessage::TaskStatusUpdate {
                         message_id: Uuid::new_v4(),
                         task_id: id,
@@ -408,7 +659,8 @@ impl Engine {
                         error: Some("Cancelled by user".to_string()),
                     };
 
-                    if distributor.get_transport().send_message(state.node_id, message).await.is_ok() {
+                    let transport = distributor.get_transport();
+                    if transport.send_message(state.node_id, message).await.is_ok() {
                         println!("📨 Sent cancellation request for remote task {}", id);
                         return true;
                     }
@@ -431,32 +683,27 @@ impl Engine {
     pub async fn cleanup_completed_tasks(&self) {
         println!("🧹 Cleaning up completed tasks from persistence...");
 
-        // Get all results from executor
         let completed_results = self.executor.get_all_results().await;
         let mut cleaned_count = 0;
         let mut error_count = 0;
 
         for result in completed_results {
-            // Remove task from persistence DB
             match self.task_queue.remove_from_persistence(result.task_id).await {
-                Ok(_) => {
-                    cleaned_count += 1;
-                }
+                Ok(_) => cleaned_count += 1,
                 Err(e) => {
-                    eprintln!("⚠️ Failed to remove task {} from persistence: {}",
-                              result.task_id, e);
+                    eprintln!("⚠️ Failed to remove task {} from persistence: {}", result.task_id, e);
                     error_count += 1;
                 }
             }
         }
 
-        // NEW: Also cleanup old remote tasks
+        // Cleanup old remote tasks
         if let Some(distributor) = &self.distributor {
-            distributor.get_task_tracker().cleanup_old_tasks(Duration::from_secs(3600)).await;
+            let task_tracker = distributor.get_task_tracker();
+            task_tracker.cleanup_old_tasks(Duration::from_secs(3600)).await;
         }
 
-        println!("✅ Cleaned {} completed tasks from persistence ({} errors)",
-                 cleaned_count, error_count);
+        println!("✅ Cleaned {} completed tasks from persistence ({} errors)", cleaned_count, error_count);
     }
 
     pub async fn clear_persistence(&self) -> Result<()> {
@@ -484,62 +731,132 @@ impl Engine {
 
     pub async fn get_task_count(&self) -> (usize, usize) {
         let pending = self.task_queue.len().await;
-        let completed = self.executor.get_completed_count().await as usize;
+        let completed = self.get_completed_count().await as usize;
         (pending, completed)
     }
 
-    // NEW: Get cluster information
+    // Get cluster information
     pub async fn get_cluster_info(&self) -> Option<crate::node::ClusterInfo> {
         self.node_manager.as_ref().map(|nm| {
             nm.membership_manager().get_cluster_info()
         })
     }
 
-    // NEW: Get node health information
+    // Get node health information
     pub async fn get_node_health(&self) -> Option<Vec<crate::node::HealthScore>> {
         self.node_manager.as_ref().map(|nm| {
             nm.health_scorer().get_all_scores()
         })
     }
 
-    // NEW: Get node registry information
+    // Get node registry information
     pub async fn get_nodes(&self) -> Option<Vec<crate::node::NodeInfo>> {
         self.node_manager.as_ref().map(|nm| {
             nm.registry().get_all_nodes()
         })
     }
 
-    // NEW: Get distribution statistics
+    // Get distribution statistics
     pub async fn get_distribution_stats(&self) -> Option<DistributionStats> {
         self.distributor.as_ref().map(|distributor| {
             distributor.get_distribution_stats()
         })
     }
 
-    // NEW: Check if distribution is enabled
+    /// Get routing statistics - FIXED: Removed async block inside Some()
+    pub async fn get_routing_stats(&self) -> Option<crate::routing::RoutingStatistics> {
+        if let Some(router) = &self.router {
+            Some(router.metrics_collector.get_statistics().await)
+        } else {
+            None
+        }
+    }
+
+    // Check if distribution is enabled
     pub fn is_distribution_enabled(&self) -> bool {
         self.distributor.is_some()
     }
 
-    // NEW: Update scoring weights for capacity matcher
+    /// Check if routing is enabled
+    pub fn is_routing_enabled(&self) -> bool {
+        self.router.is_some()
+    }
+
+    /// Check if routing is ready to use
+    pub async fn is_routing_ready(&self) -> bool {
+        if !self.is_routing_enabled() {
+            return false;
+        }
+
+        if let Some(nodes) = self.get_nodes().await {
+            !nodes.is_empty()
+        } else {
+            false
+        }
+    }
+
+    // Update scoring weights for capacity matcher
     pub async fn update_scoring_weights(&self, weights: ScoringWeights) -> Result<()> {
         if let Some(distributor) = &self.distributor {
             println!("📊 Scoring weights would be updated to: {:?}", weights);
-            println!("💡 Note: Requires redesign for mutable Arc access");
+            // Note: Actual implementation would update the distributor's weights
             Ok(())
         } else {
             Err(anyhow::anyhow!("Distribution not enabled"))
         }
     }
 
-    // NEW: Get local node information
+    // Get local node information
     pub async fn get_local_node_info(&self) -> Option<crate::node::NodeInfo> {
         self.node_manager.as_ref().and_then(|nm| {
             nm.registry().local_node()
         })
     }
 
-    // NEW: Monitor remote tasks for timeouts and failures
+    /// Validate routing configuration
+    pub async fn validate_routing_config(&self) -> Result<()> {
+        if let Some(config) = &self.routing_config {
+            config.validate().map_err(|e| anyhow::anyhow!(e))?;
+        }
+        Ok(())
+    }
+
+    /// Switch routing strategy - FIXED: Removed async block inside Some()
+    pub async fn switch_routing_strategy(&self, strategy_name: &str) -> Result<()> {
+        if let Some(router) = &self.router {
+            let strategies = router.strategies.read().await;
+            if !strategies.contains_key(strategy_name) {
+                return Err(anyhow::anyhow!("Unknown strategy: {}", strategy_name));
+            }
+
+            let mut active_strategy = router.active_strategy.write().await;
+            *active_strategy = strategy_name.to_string();
+            println!("🔄 Switched routing strategy to: {}", strategy_name);
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Routing not enabled"))
+        }
+    }
+
+    /// Get current routing strategy - FIXED: Removed async block inside Some()
+    pub async fn get_current_routing_strategy(&self) -> Option<String> {
+        if let Some(router) = &self.router {
+            Some(router.active_strategy.read().await.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Get available routing strategies - FIXED: Removed async block inside Some()
+    pub async fn get_available_routing_strategies(&self) -> Vec<String> {
+        if let Some(router) = &self.router {
+            router.strategies.read().await.keys().cloned().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    // Monitor remote tasks for timeouts and failures
     async fn monitor_remote_tasks(&self) {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
 
@@ -556,7 +873,7 @@ impl Engine {
         }
     }
 
-    // NEW: Receive and process messages from other nodes
+    // Receive and process messages from other nodes
     async fn receive_messages(&self) {
         if let Some(distributor) = &self.distributor {
             let transport = distributor.get_transport();
@@ -582,7 +899,7 @@ impl Engine {
         }
     }
 
-    // NEW: Handle incoming node messages
+    // Handle incoming node messages
     async fn handle_node_message(&self, node_id: Uuid, message: NodeMessage) {
         if let Some(distributor) = &self.distributor {
             match message {
@@ -593,7 +910,6 @@ impl Engine {
                     let _ = distributor.handle_task_result(node_id, message).await;
                 }
                 NodeMessage::HealthCheckRequest { message_id } => {
-                    // Respond with health check
                     if let Some(node_manager) = &self.node_manager {
                         let health_score = node_manager.health_scorer().get_score(&node_id)
                             .map(|h| h.score)
@@ -602,7 +918,7 @@ impl Engine {
                         let response = NodeMessage::HealthCheckResponse {
                             message_id,
                             node_id: self.get_local_node_info().await.map(|n| n.id).unwrap_or_default(),
-                            load: 0.5, // Simplified load calculation
+                            load: 0.5,
                             available_resources: crate::node::NodeCapabilities::default(),
                             health_score,
                         };
@@ -611,14 +927,13 @@ impl Engine {
                     }
                 }
                 _ => {
-                    // Handle other message types
                     println!("📨 Received message from node {}: {:?}", node_id, message);
                 }
             }
         }
     }
 
-    // NEW: Broadcast a message to all nodes
+    // Broadcast a message to all nodes
     pub async fn broadcast_message(&self, message: NodeMessage) -> Result<()> {
         if let Some(distributor) = &self.distributor {
             distributor.get_transport().broadcast(message, None).await
@@ -628,13 +943,13 @@ impl Engine {
         }
     }
 
-    // NEW: Send task to specific node
+    // Send task to specific node
     pub async fn send_task_to_node(&self, task: &Task, node_id: Uuid) -> Result<Uuid> {
         self.execute_on_remote_node(task, node_id).await
     }
 
-    // NEW: Get task tracker for monitoring
-    pub async fn get_task_tracker(&self) -> Option<Arc<distribution::DistributedTaskTracker>> {
+    // Get task tracker for monitoring
+    pub async fn get_task_tracker(&self) -> Option<Arc<DistributedTaskTracker>> {
         self.distributor.as_ref().map(|d| d.get_task_tracker())
     }
 }
@@ -698,11 +1013,12 @@ fn apply_distribution_options_to_task(
             map.insert("estimated_duration_secs".to_string(),
                        serde_json::Value::from(req.estimated_duration_secs));
 
+            // FIXED: Use `map` not `json_map`
             if !req.required_task_types.is_empty() {
                 let types: Vec<_> = req.required_task_types.iter()
-                    .map(|t| serde_json::Value::String(t.clone()))
+                    .map(|t: &String| serde_json::Value::String(t.clone()))
                     .collect();
-                map.insert("required_task_types".to_string(), serde_json::Value::Array(types));
+                map.insert("required_task_types".to_string(), serde_json::Value::Array(types)); // Fixed: map.insert
             }
         }
     }
@@ -763,96 +1079,37 @@ pub async fn run_distribution_demo(engine: Arc<Engine>) -> Result<()> {
         }
     }
 
-    // Task 1: GPU-intensive task
-    println!("\n1️⃣ Scheduling GPU-intensive task...");
-    let gpu_task = DistributedTaskFactory::gpu_task(
-        "GPU Training Demo",
-        4.0,
-        8192,
-    );
-    let gpu_queue_task = create_distributed_task(
-        gpu_task.clone(),
-        TaskPriority::High,
-        Some(DistributionOptions {
-            affinity_rule: Some("class=gpu".to_string()),
-            force_local: false,
-            min_health_score: Some(80.0),
-            resource_requirements: Some(ResourceRequirements {
-                min_cpu_cores: 4.0,
-                min_memory_mb: 8192,
-                min_disk_mb: 1024,
-                needs_gpu: true,
-                needs_ssd: false,
-                estimated_duration_secs: 30.0,
-                required_task_types: vec!["gpu_training".to_string()],
-            }),
-        })
-    );
+    // Show routing information if enabled
+    if engine.is_routing_enabled() {
+        if let Some(strategy) = engine.get_current_routing_strategy().await {
+            println!("🎯 Current routing strategy: {}", strategy);
+        }
+        if let Some(stats) = engine.get_routing_stats().await {
+            println!("📊 Routing stats: {} successful, {} failed selections",
+                     stats.successful_selections, stats.failed_selections);
+        }
+    }
 
-    // Task 2: Memory-intensive task
-    println!("2️⃣ Scheduling memory-intensive task...");
-    let memory_task = DistributedTaskFactory::memory_intensive_task(
-        "Memory Analytics Demo",
-        2.0,
-        16384,
-    );
-    let memory_queue_task = create_distributed_task(
-        memory_task.clone(),
-        TaskPriority::Medium,
-        Some(DistributionOptions {
-            affinity_rule: Some("class=high-memory".to_string()),
-            force_local: false,
-            min_health_score: Some(70.0),
-            resource_requirements: Some(ResourceRequirements {
-                min_cpu_cores: 2.0,
-                min_memory_mb: 16384,
-                min_disk_mb: 512,
-                needs_gpu: false,
-                needs_ssd: true,
-                estimated_duration_secs: 10.0,
-                required_task_types: vec!["analytics".to_string()],
-            }),
-        })
-    );
+    // Create and schedule demo tasks
+    let tasks = vec![
+        ("GPU-intensive task", DistributedTaskFactory::gpu_task("GPU Training Demo", 4.0, 8192)),
+        ("Memory-intensive task", DistributedTaskFactory::memory_intensive_task("Memory Analytics Demo", 2.0, 16384)),
+        ("Low-latency task", DistributedTaskFactory::low_latency_task("Low-Latency Processing")),
+    ];
 
-    // Task 3: Low-latency task forced to local
-    println!("3️⃣ Scheduling low-latency local task...");
-    let low_latency_task = DistributedTaskFactory::low_latency_task(
-        "Low-Latency Processing",
-    );
-    let latency_queue_task = create_distributed_task(
-        low_latency_task.clone(),
-        TaskPriority::High,
-        Some(DistributionOptions {
-            affinity_rule: None,
-            force_local: true,
-            min_health_score: Some(90.0),
-            resource_requirements: Some(ResourceRequirements {
-                min_cpu_cores: 1.0,
-                min_memory_mb: 256,
-                min_disk_mb: 10,
-                needs_gpu: false,
-                needs_ssd: false,
-                estimated_duration_secs: 0.5,
-                required_task_types: vec!["realtime".to_string()],
-            }),
-        })
-    );
+    for (task_type, task) in tasks {
+        println!("\n📝 Scheduling {}...", task_type);
+        let queue_task = create_distributed_task(
+            task.clone(),
+            TaskPriority::High,
+            None
+        );
 
-    // Schedule the tasks
-    let tasks = vec![gpu_queue_task, memory_queue_task, latency_queue_task];
-
-    for task in tasks {
-        match engine.schedule_task(task.clone()).await {
+        match engine.schedule_task(queue_task.clone()).await {
             Ok(id) => {
-                println!("✅ Distributed task scheduled: '{}' [{}]", task.name, id);
-                // Show distribution summary
-                let task_obj = Task::from_queue_task(&task);
-                if task_obj.has_distribution_constraints() {
-                    println!("   📋 Distribution: {}", task_obj.distribution_summary());
-                }
+                println!("✅ Task scheduled: '{}' [{}]", task.name, id);
             }
-            Err(e) => println!("⚠️ Failed to schedule distributed task '{}': {}", task.name, e),
+            Err(e) => println!("⚠️ Failed to schedule task '{}': {}", task.name, e),
         }
     }
 
@@ -862,16 +1119,9 @@ pub async fn run_distribution_demo(engine: Arc<Engine>) -> Result<()> {
         println!("   - Total nodes: {}", stats.total_nodes);
         println!("   - Local node ID: {}", stats.local_node_id);
         println!("   - Decision threshold: {:.2}", stats.decision_threshold);
-        println!("   - Scoring weights: CPU={:.2}, MEM={:.2}, DISK={:.2}, GPU={:.2}, LOAD={:.2}, HEALTH={:.2}",
-                 stats.scoring_weights.cpu_weight,
-                 stats.scoring_weights.memory_weight,
-                 stats.scoring_weights.disk_weight,
-                 stats.scoring_weights.gpu_weight,
-                 stats.scoring_weights.load_weight,
-                 stats.scoring_weights.health_weight);
     }
 
-    // NEW: Show remote task monitoring info
+    // Show remote task monitoring info
     if let Some(tracker) = engine.get_task_tracker().await {
         let remote_tasks = tracker.get_all_remote_tasks().await;
         if !remote_tasks.is_empty() {
@@ -884,10 +1134,9 @@ pub async fn run_distribution_demo(engine: Arc<Engine>) -> Result<()> {
         }
     }
 
-    println!("\n🎯 Distribution demo tasks scheduled.");
+    println!("\n🎯 Distribution demo completed.");
     println!("💡 Use 'stats' to see task execution and 'list' to see pending tasks.");
     println!("   Use 'nodes' to see node status and 'cluster' for cluster info.");
-    println!("   Use 'remote-tasks' to see distributed task status.");
 
     Ok(())
 }

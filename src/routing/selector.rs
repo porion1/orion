@@ -1,7 +1,7 @@
 use crate::engine::executor::TaskExecutor;
 use crate::engine::queue::{QueueTask, SharedTaskQueue};
 use crate::engine::task::{Task, TaskType};
-use metrics::{counter, gauge};
+use crate::node::registry::NodeRegistry;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::watch;
@@ -13,6 +13,7 @@ use uuid::Uuid;
 pub struct Scheduler {
     queue: Arc<SharedTaskQueue>,
     executor: Arc<TaskExecutor>,
+    node_registry: Option<Arc<NodeRegistry>>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_received: Arc<tokio::sync::RwLock<bool>>,
 }
@@ -22,12 +23,14 @@ impl Scheduler {
     pub fn new(
         queue: Arc<SharedTaskQueue>,
         executor: Arc<TaskExecutor>,
+        node_registry: Option<Arc<NodeRegistry>>,
     ) -> Self {
         let (shutdown_tx, _) = watch::channel(false);
 
         Self {
             queue,
             executor,
+            node_registry,
             shutdown_tx,
             shutdown_received: Arc::new(tokio::sync::RwLock::new(false)),
         }
@@ -44,13 +47,13 @@ impl Scheduler {
             tokio::select! {
                 _ = ticker.tick() => {
                     if *self.shutdown_received.read().await {
+                        println!("⏸️  Scheduler paused (shutdown received)");
                         continue;
                     }
 
                     self.process_ready_tasks().await;
                     self.update_metrics().await;
                 }
-
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         println!("🛑 Scheduler shutting down");
@@ -59,7 +62,6 @@ impl Scheduler {
                         if let Err(e) = self.queue.persist_all().await {
                             eprintln!("⚠️ Failed to persist queue state during shutdown: {}", e);
                         }
-
                         break;
                     }
                 }
@@ -70,18 +72,16 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Drain queue and dispatch tasks
+    /// Dequeue and submit all available tasks
     async fn process_ready_tasks(&self) {
         while let Some(task) = self.queue.dequeue().await {
             self.dispatch(task).await;
         }
     }
 
-    /// Dispatch a single task
+    /// Dispatch task to executor
     async fn dispatch(&self, task: QueueTask) {
-        counter!("orion.scheduler.tasks_scheduled_total", 1);
-
-        // Respect scheduled execution time
+        // Wait until scheduled execution time
         if let Ok(delay) = task.scheduled_at.duration_since(SystemTime::now()) {
             if delay > Duration::ZERO {
                 tokio::time::sleep(delay).await;
@@ -90,9 +90,7 @@ impl Scheduler {
 
         let task_id = task.id;
 
-        // 🔌 ROUTING HOOK
-        // The executor is responsible for routing, node selection, and execution.
-        // Scheduler must remain routing-agnostic.
+        // Execute the task
         self.executor.execute_task(task.clone()).await;
 
         // Allow executor to publish result
@@ -105,11 +103,12 @@ impl Scheduler {
         }
     }
 
-    /// Retry logic
+    /// Handle task result and retry logic
     async fn handle_task_result(&self, task_id: Uuid, task: &QueueTask) {
         if let Some(result) = self.executor.get_result(task_id).await {
             if !result.success && task.retry_count < task.max_retries {
                 if *self.shutdown_received.read().await {
+                    println!("⏹️  Skipping retry for task {} (shutdown in progress)", task_id);
                     return;
                 }
 
@@ -117,27 +116,34 @@ impl Scheduler {
                 retry.retry_count += 1;
                 retry.scheduled_at = SystemTime::now() + Duration::from_secs(5);
 
-                if self.queue.enqueue(retry).await.is_ok() {
-                    counter!("orion.scheduler.tasks_retried_total", 1);
-                } else {
-                    counter!("orion.scheduler.tasks_retry_failed_total", 1);
+                match self.queue.enqueue(retry).await {
+                    Ok(_) => {
+                        println!("🔄 Task {} scheduled for retry", task_id);
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️ Failed to enqueue retry for task {}: {}", task_id, e);
+                    }
                 }
             }
         }
     }
 
-    /// Recurring task handling
+    /// Handle recurring tasks
     async fn handle_recurring_tasks(&self, task: &QueueTask) {
         if let TaskType::Recurring { .. } = task.task_type {
             if *self.shutdown_received.read().await {
+                println!("⏹️  Skipping recurring task reschedule (shutdown in progress)");
                 return;
             }
 
             if let Some(next) = Task::from_queue_task(task).create_next_occurrence() {
-                if self.queue.enqueue((&next).into()).await.is_ok() {
-                    counter!("orion.scheduler.tasks_rescheduled_total", 1);
-                } else {
-                    counter!("orion.scheduler.tasks_reschedule_failed_total", 1);
+                match self.queue.enqueue((&next).into()).await {
+                    Ok(_) => {
+                        println!("📅 Recurring task {} rescheduled", task.id);
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️ Failed to reschedule recurring task {}: {}", task.id, e);
+                    }
                 }
             }
         }
@@ -146,33 +152,42 @@ impl Scheduler {
     /// Emit scheduler metrics
     async fn update_metrics(&self) {
         let pending = self.queue.len().await;
-        gauge!("orion.scheduler.tasks_pending", pending as f64);
+        println!("📊 Pending tasks: {}", pending);
 
-        gauge!(
-            "orion.scheduler.shutdown_state",
-            if *self.shutdown_received.read().await { 1.0 } else { 0.0 }
-        );
+        if let Some(node_registry) = &self.node_registry {
+            let node_count = node_registry.get_all_nodes().len();
+            println!("🖥️  Available nodes: {}", node_count);
+        }
+
+        if *self.shutdown_received.read().await {
+            println!("🛑 Scheduler shutdown in progress");
+        }
     }
 
-    /// Public API
+    /// Public API: schedule a task
     pub async fn schedule(&self, task: QueueTask) -> anyhow::Result<Uuid> {
         if *self.shutdown_received.read().await {
-            return Err(anyhow::anyhow!("Scheduler is shutting down"));
+            return Err(anyhow::anyhow!("Scheduler is shutting down, cannot schedule new tasks"));
         }
 
         let id = task.id;
         self.queue.enqueue(task).await?;
+
+        println!("✅ Task scheduled: {}", id);
         Ok(id)
     }
 
+    /// Shutdown signal handle
     pub fn shutdown_handle(&self) -> watch::Sender<bool> {
         self.shutdown_tx.clone()
     }
 
+    // Check if scheduler is shutting down
     pub async fn is_shutting_down(&self) -> bool {
         *self.shutdown_received.read().await
     }
 
+    // Get shutdown state for monitoring
     pub async fn get_shutdown_state(&self) -> String {
         if *self.shutdown_received.read().await {
             "shutting_down".to_string()

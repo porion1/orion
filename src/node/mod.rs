@@ -14,7 +14,9 @@ pub use classification::{NodeClassification, Classifier, TaskAffinity, NetworkTo
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::sync::RwLock;
+use serde_json;
 
 // Node Manager main struct
 #[derive(Debug)]
@@ -26,6 +28,8 @@ pub struct NodeManager {
     running: AtomicBool,
     // NEW: Distribution-related components
     distribution_metrics: Arc<RwLock<DistributionMetrics>>,
+    // NEW: Store local node ID
+    local_node_id: uuid::Uuid,
 }
 
 // NEW: Metrics for distribution decisions
@@ -52,11 +56,15 @@ pub struct NodeUtilization {
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
     pub node_id: Option<uuid::Uuid>,
+    pub node_name: Option<String>, // NEW: Added node name
+    pub hostname: Option<String>, // NEW: Added hostname
     pub listen_address: std::net::SocketAddr,
     pub heartbeat_interval_ms: u64,
     pub persistence_path: Option<String>,
     pub cluster_peers: Vec<std::net::SocketAddr>,
-    // NEW: Distribution-specific configuration
+    // NEW: Capabilities for the local node
+    pub capabilities: Option<NodeCapabilities>, // NEW: Added capabilities
+    // Distribution-specific configuration
     pub enable_distribution: bool,
     pub distribution_metrics_interval_ms: u64,
     pub default_task_affinity: Option<String>,
@@ -68,6 +76,42 @@ impl NodeManager {
             config.persistence_path.as_deref()
         )?);
 
+        // Generate or use provided node ID
+        let local_node_id = config.node_id.unwrap_or_else(uuid::Uuid::new_v4);
+
+        // Register the local node FIRST - USING CORRECT FIELDS
+        let local_node_info = NodeInfo {
+            id: local_node_id,
+            address: config.listen_address, // FIXED: Changed from listen_address to address
+            hostname: config.hostname.unwrap_or_else(|| {
+                hostname::get()
+                    .unwrap_or_else(|_| "localhost".into())
+                    .to_string_lossy()
+                    .to_string()
+            }),
+            capabilities: config.capabilities.unwrap_or_else(|| NodeCapabilities {
+                cpu_cores: 4,
+                memory_mb: 8192,
+                storage_mb: 102400, // FIXED: Changed from 10240 to 102400 (matches default)
+                max_concurrent_tasks: 50, // Note: Default is 10, but using 50 for distribution
+                supported_task_types: NodeCapabilities::default().supported_task_types,
+                // REMOVED: region and zone fields
+            }),
+            status: NodeStatus::Active,
+            last_seen: SystemTime::now(), // FIXED: Changed from last_heartbeat to last_seen
+            metadata: serde_json::json!({}), // FIXED: Must be serde_json::Value
+            version: "1.0".to_string(),
+        };
+
+        // Register the local node
+        if let Err(e) = registry.register(local_node_info.clone()) {
+            return Err(crate::utils::error::OrionError::NodeError(
+                format!("Failed to register local node: {}", e)
+            ));
+        }
+
+        println!("✅ Local node registered: {}", local_node_id);
+
         let health_scorer = Arc::new(HealthScorer::new(registry.clone()));
 
         let membership_manager = Arc::new(MembershipManager::new(
@@ -76,10 +120,9 @@ impl NodeManager {
             MembershipConfig::default(),
         ));
 
-        let local_node_id = config.node_id.unwrap_or_else(uuid::Uuid::new_v4);
         let classifier = Arc::new(Classifier::new(local_node_id));
 
-        // NEW: Initialize distribution metrics
+        // Initialize distribution metrics
         let distribution_metrics = Arc::new(RwLock::new(DistributionMetrics {
             task_assignments: 0,
             local_executions: 0,
@@ -96,13 +139,14 @@ impl NodeManager {
             classifier,
             running: AtomicBool::new(false),
             distribution_metrics,
+            local_node_id, // Store local node ID
         })
     }
 
     pub fn start(&self) -> Result<(), crate::utils::error::OrionError> {
         self.running.store(true, Ordering::SeqCst);
 
-        // NEW: Start distribution metrics collection if enabled
+        // Start distribution metrics collection if enabled
         if self.is_distribution_enabled() {
             self.start_distribution_metrics_collection();
         }
@@ -134,12 +178,21 @@ impl NodeManager {
         self.classifier.clone()
     }
 
-    // NEW: Distribution-related methods
+    // NEW: Get local node ID
+    pub fn local_node_id(&self) -> uuid::Uuid {
+        self.local_node_id
+    }
+
+    // NEW: Get local node info
+    pub fn local_node_info(&self) -> Option<NodeInfo> {
+        self.registry.get(&self.local_node_id)
+    }
+
+    // Distribution-related methods
 
     /// Check if distribution features are enabled
     pub fn is_distribution_enabled(&self) -> bool {
         // For now, check if we have cluster peers
-        // In a real implementation, this would check the config
         !self.membership_manager.get_cluster_peers().is_empty()
     }
 
@@ -218,7 +271,6 @@ impl NodeManager {
         let active_nodes = self.registry.get_active_nodes();
         let mut utilization = Vec::new();
 
-        // FIX: Iterate over references instead of moving ownership
         for node in &active_nodes {
             // In a real implementation, this would collect actual utilization metrics
             // from heartbeat data or monitoring system
@@ -236,7 +288,7 @@ impl NodeManager {
         Ok(utilization)
     }
 
-    /// NEW: Get overall cluster capacity
+    /// Get overall cluster capacity
     pub async fn get_cluster_capacity(&self) -> ClusterCapacity {
         let active_nodes = self.registry.get_active_nodes();
         let mut total_cpu = 0;
@@ -244,7 +296,6 @@ impl NodeManager {
         let mut total_storage = 0;
         let mut total_task_capacity = 0;
 
-        // FIX: Same issue here - iterate over references
         for node in &active_nodes {
             total_cpu += node.capabilities.cpu_cores;
             total_memory += node.capabilities.memory_mb;
@@ -261,7 +312,7 @@ impl NodeManager {
         }
     }
 
-    /// NEW: Check if cluster can handle a task with given requirements
+    /// Check if cluster can handle a task with given requirements
     pub async fn can_handle_task(&self, cpu_cores: u32, memory_mb: u64, storage_mb: u64) -> bool {
         let candidates = self.get_distribution_candidates(70.0).await;
 
@@ -272,7 +323,7 @@ impl NodeManager {
         })
     }
 
-    /// NEW: Get recommended nodes for a task
+    /// Get recommended nodes for a task
     pub async fn get_recommended_nodes(&self,
                                        cpu_cores: u32,
                                        memory_mb: u64,
@@ -307,7 +358,7 @@ impl NodeManager {
             .collect()
     }
 
-    /// NEW: Reset distribution metrics
+    /// Reset distribution metrics
     pub async fn reset_distribution_metrics(&self) {
         let mut metrics = self.distribution_metrics.write().await;
         *metrics = DistributionMetrics {
@@ -320,7 +371,7 @@ impl NodeManager {
         };
     }
 
-    /// NEW: Get distribution statistics
+    /// Get distribution statistics
     pub async fn get_distribution_stats(&self) -> DistributionStats {
         let metrics = self.distribution_metrics.read().await;
         let capacity = self.get_cluster_capacity().await;
@@ -351,7 +402,7 @@ impl NodeManager {
     }
 }
 
-// NEW: Cluster capacity information
+// Cluster capacity information
 #[derive(Debug, Clone)]
 pub struct ClusterCapacity {
     pub total_nodes: usize,
@@ -361,7 +412,7 @@ pub struct ClusterCapacity {
     pub total_task_capacity: u32,
 }
 
-// NEW: Distribution statistics
+// Distribution statistics
 #[derive(Debug, Clone)]
 pub struct DistributionStats {
     pub total_task_assignments: u64,
@@ -382,6 +433,7 @@ impl Clone for NodeManager {
             classifier: self.classifier.clone(),
             running: AtomicBool::new(self.running.load(Ordering::SeqCst)),
             distribution_metrics: self.distribution_metrics.clone(),
+            local_node_id: self.local_node_id,
         }
     }
 }
@@ -391,11 +443,21 @@ impl From<crate::engine::config::ClusterConfig> for NodeConfig {
     fn from(cluster_config: crate::engine::config::ClusterConfig) -> Self {
         Self {
             node_id: cluster_config.node_id,
+            node_name: Some("local-node".to_string()), // Default name
+            hostname: Some("localhost".to_string()), // Default hostname
             listen_address: cluster_config.node_listen_addr,
             heartbeat_interval_ms: cluster_config.heartbeat_interval_ms,
             persistence_path: cluster_config.node_persistence_path,
             cluster_peers: cluster_config.cluster_peers,
-            // NEW: Default distribution settings
+            capabilities: Some(NodeCapabilities { // Default capabilities
+                cpu_cores: 4,
+                memory_mb: 8192,
+                storage_mb: 102400, // FIXED: Changed to match registry default
+                max_concurrent_tasks: 50,
+                supported_task_types: NodeCapabilities::default().supported_task_types,
+                // REMOVED: region and zone fields
+            }),
+            // Default distribution settings
             enable_distribution: true,
             distribution_metrics_interval_ms: 30000,
             default_task_affinity: None,
@@ -403,15 +465,25 @@ impl From<crate::engine::config::ClusterConfig> for NodeConfig {
     }
 }
 
-// NEW: Default implementation for NodeConfig
+// Default implementation for NodeConfig
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             node_id: None,
+            node_name: Some("local-node".to_string()),
+            hostname: Some("localhost".to_string()),
             listen_address: "127.0.0.1:8080".parse().unwrap(),
             heartbeat_interval_ms: 5000,
             persistence_path: None,
             cluster_peers: Vec::new(),
+            capabilities: Some(NodeCapabilities {
+                cpu_cores: 4,
+                memory_mb: 8192,
+                storage_mb: 102400, // FIXED: Changed to match registry default
+                max_concurrent_tasks: 50,
+                supported_task_types: NodeCapabilities::default().supported_task_types,
+                // REMOVED: region and zone fields
+            }),
             enable_distribution: false,
             distribution_metrics_interval_ms: 30000,
             default_task_affinity: None,

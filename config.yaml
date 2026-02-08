@@ -4,3 +4,55 @@ logging_level: "info"
 persistence_path: "./orion-data"
 metrics_port: 9000
 metrics_enabled: true
+
+# Node configuration (MOVED from cluster section)
+node:
+  name: "node-1"
+  hostname: "localhost"
+  listen_addr: "0.0.0.0:8080"
+  capabilities:
+    cpu_cores: 4
+    memory_mb: 8192
+    storage_mb: 102400
+    max_concurrent_tasks: 50
+    supported_task_types:
+      - default
+      - gpu
+      - high-memory
+      - memory-intensive
+      - cpu-intensive
+      - low-latency
+      - general
+      - io-intensive
+
+# Cluster configuration
+cluster:
+  enabled: true
+  cluster_name: "orion-cluster"
+  node_listen_addr: "0.0.0.0:9090"  # Different port for cluster communication
+  cluster_peers: []
+  heartbeat_interval_ms: 5000
+  failure_timeout_ms: 30000
+  discovery_type: "local"
+
+# Routing configuration
+routing:
+  enabled: true
+  default_strategy: "least_loaded"
+  strategies:
+    round_robin:
+      enabled: true
+    least_loaded:
+      enabled: true
+      weight_cpu: 0.4
+      weight_memory: 0.3
+      weight_latency: 0.3
+    latency_aware:
+      enabled: true
+      latency_threshold_ms: 100
+    failover:
+      enabled: true
+      max_retries: 3
+      blacklist_duration_secs: 300
+  selection_timeout_ms: 5000
+  health_check_interval_secs: 10

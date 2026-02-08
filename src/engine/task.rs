@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+// src/engine/task.rs
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
@@ -161,8 +162,32 @@ impl From<&ResourceRequirements> for TaskRequirements {
             min_disk_mb: req.min_disk_mb,
             needs_gpu: req.needs_gpu,
             estimated_duration_secs: req.estimated_duration_secs,
-            required_task_types: req.required_task_types.clone(),
+            required_task_types: req.required_task_types.iter().cloned().collect(),
         }
+    }
+}
+
+/// --------------------------------
+/// TaskRequirements to serde_json::Value
+/// --------------------------------
+impl From<TaskRequirements> for serde_json::Value {
+    fn from(req: TaskRequirements) -> Self {
+        let mut json_map = serde_json::Map::new();
+
+        json_map.insert("min_cpu_cores".to_string(), serde_json::Value::from(req.min_cpu_cores as f64));
+        json_map.insert("min_memory_mb".to_string(), serde_json::Value::from(req.min_memory_mb));
+        json_map.insert("min_disk_mb".to_string(), serde_json::Value::from(req.min_disk_mb));
+        json_map.insert("needs_gpu".to_string(), serde_json::Value::from(req.needs_gpu));
+        json_map.insert("estimated_duration_secs".to_string(), serde_json::Value::from(req.estimated_duration_secs));
+
+        if !req.required_task_types.is_empty() {
+            let types: Vec<_> = req.required_task_types.iter()
+                .map(|t: &String| serde_json::Value::String(t.clone()))
+                .collect();
+            json_map.insert("required_task_types".to_string(), serde_json::Value::Array(types));
+        }
+
+        serde_json::Value::Object(json_map)
     }
 }
 
@@ -380,7 +405,7 @@ impl Task {
 
     /// NEW: Update remote task status
     pub fn update_remote_status(mut self, status: RemoteTaskStatus, progress: f32, message: Option<String>) -> Self {
-        // FIX: Check the status before moving it
+        // Check the status before moving it
         let should_end_remote_execution = matches!(status, RemoteTaskStatus::Completed | RemoteTaskStatus::Failed(_) | RemoteTaskStatus::Cancelled);
 
         // Clone the status for the update record before consuming it
@@ -398,7 +423,7 @@ impl Task {
         self.status = status.into();
         self.updated_at = SystemTime::now();
 
-        // FIX: Use the flag instead of checking the moved status
+        // Use the flag instead of checking the moved status
         if should_end_remote_execution {
             self.distribution.remote_execution_ended = Some(SystemTime::now());
         }
@@ -411,7 +436,77 @@ impl Task {
         if let Some(ref req) = self.distribution.resource_requirements {
             req.into()
         } else {
-            TaskRequirements::from_task(self)
+            // Fallback to extracting from payload
+            let mut requirements = TaskRequirements {
+                min_cpu_cores: 0.1,
+                min_memory_mb: 50,
+                min_disk_mb: 10,
+                needs_gpu: false,
+                estimated_duration_secs: 5.0,
+                required_task_types: HashSet::new(),
+            };
+
+            // Extract from payload
+            if let Some(payload) = &self.payload {
+                if let serde_json::Value::Object(map) = payload {
+                    if let Some(cpu_val) = map.get("cpu_cores").and_then(|v| v.as_f64()) {
+                        requirements.min_cpu_cores = cpu_val as f32;
+                    }
+
+                    if let Some(mem_val) = map.get("memory_mb").and_then(|v| v.as_u64()) {
+                        requirements.min_memory_mb = mem_val;
+                    }
+
+                    if let Some(disk_val) = map.get("disk_mb").and_then(|v| v.as_u64()) {
+                        requirements.min_disk_mb = disk_val;
+                    }
+
+                    if let Some(gpu_val) = map.get("needs_gpu").and_then(|v| v.as_bool()) {
+                        requirements.needs_gpu = gpu_val;
+                    }
+
+                    if let Some(dur_val) = map.get("estimated_duration_secs").and_then(|v| v.as_f64()) {
+                        requirements.estimated_duration_secs = dur_val;
+                    }
+
+                    // Extract task_type
+                    if let Some(task_type_val) = map.get("task_type").and_then(|v| v.as_str()) {
+                        requirements.required_task_types.insert(task_type_val.to_string());
+                    }
+
+                    // Extract from affinity rules
+                    if let Some(affinity_val) = map.get("affinity").and_then(|v| v.as_str()) {
+                        for part in affinity_val.split(',') {
+                            let part = part.trim();
+                            if let Some((key, value)) = part.split_once('=') {
+                                if key.trim() == "class" {
+                                    requirements.required_task_types.insert(value.trim().to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Extract from metadata
+            if let Some(metadata) = &self.metadata {
+                if let Some(task_type_val) = metadata.get("task_type") {
+                    requirements.required_task_types.insert(task_type_val.to_string());
+                }
+
+                if let Some(affinity_val) = metadata.get("affinity") {
+                    for part in affinity_val.split(',') {
+                        let part = part.trim();
+                        if let Some((key, value)) = part.split_once('=') {
+                            if key.trim() == "class" {
+                                requirements.required_task_types.insert(value.trim().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
+            requirements
         }
     }
 
@@ -474,9 +569,6 @@ impl Task {
         let serialized_task = self.serialize_for_distribution()?;
         let requirements = self.get_requirements();
         let affinity_rules = self.distribution.affinity_rules.clone();
-
-        // Use the node_id parameter
-        let _node_id = node_id; // Use it to avoid unused parameter warning
 
         Ok(NodeMessage::TaskAssignment {
             message_id: Uuid::new_v4(),
@@ -909,7 +1001,7 @@ pub fn create_distributed_one_shot(
         task = task.with_tags(distribution_options.tags);
     }
 
-    // FIX: Handle the case where with_affinity_rules returns an error
+    // Handle the case where with_affinity_rules returns an error
     if let Some(affinity_rules) = distribution_options.affinity_rules {
         match task.with_affinity_rules(&affinity_rules) {
             Ok(t) => task = t,

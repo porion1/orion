@@ -1,16 +1,17 @@
 // src/engine/distribution.rs
-use crate::engine::task::Task;
-use crate::node::{NodeManager, NodeInfo, NodeCapabilities};
+use crate::engine::task::{Task, TaskType, TaskStatus, DistributionMetadata};
+use crate::node::{NodeManager, NodeInfo, NodeCapabilities, NodeClassification};
 use crate::node::health::HealthScorer;
 use std::sync::Arc;
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use anyhow::{Result, anyhow};
 use std::time::{SystemTime, Duration};
 use tokio::sync::{RwLock, Mutex};
 use async_trait::async_trait;
-use std::net::{SocketAddr, IpAddr, Ipv4Addr};
+use std::net::SocketAddr;
+use log::{info, warn, error, debug};
 
 // ============================================
 // ORION-ENG-045: Node-capacity-aware task assignment
@@ -23,7 +24,7 @@ pub struct TaskRequirements {
     pub min_disk_mb: u64,
     pub needs_gpu: bool,
     pub estimated_duration_secs: f64,
-    pub required_task_types: Vec<String>,
+    pub required_task_types: HashSet<String>,
 }
 
 impl TaskRequirements {
@@ -34,35 +35,67 @@ impl TaskRequirements {
             min_disk_mb: 10,
             needs_gpu: false,
             estimated_duration_secs: 5.0,
-            required_task_types: vec![],
+            required_task_types: HashSet::new(),
         };
 
-        if let Some(metadata) = &task.metadata {
-            if let Some(cpu_str) = metadata.get("cpu_cores") {
-                if let Ok(cpu_val) = cpu_str.parse::<f32>() {
-                    requirements.min_cpu_cores = cpu_val;
+        // Extract from payload
+        if let Some(payload) = &task.payload {
+            if let serde_json::Value::Object(map) = payload {
+                if let Some(cpu_val) = map.get("cpu_cores").and_then(|v| v.as_f64()) {
+                    requirements.min_cpu_cores = cpu_val as f32;
                 }
-            }
 
-            if let Some(memory_str) = metadata.get("memory_mb") {
-                if let Ok(mem_val) = memory_str.parse::<u64>() {
+                if let Some(mem_val) = map.get("memory_mb").and_then(|v| v.as_u64()) {
                     requirements.min_memory_mb = mem_val;
                 }
-            }
 
-            if let Some(gpu_str) = metadata.get("needs_gpu") {
-                if let Ok(gpu_val) = gpu_str.parse::<bool>() {
+                if let Some(disk_val) = map.get("disk_mb").and_then(|v| v.as_u64()) {
+                    requirements.min_disk_mb = disk_val;
+                }
+
+                if let Some(gpu_val) = map.get("needs_gpu").and_then(|v| v.as_bool()) {
                     requirements.needs_gpu = gpu_val;
                 }
-            }
 
-            if let Some(task_type) = metadata.get("task_type") {
-                requirements.required_task_types.push(task_type.clone());
-            }
-
-            if let Some(duration_str) = metadata.get("estimated_duration_secs") {
-                if let Ok(dur_val) = duration_str.parse::<f64>() {
+                if let Some(dur_val) = map.get("estimated_duration_secs").and_then(|v| v.as_f64()) {
                     requirements.estimated_duration_secs = dur_val;
+                }
+
+                // Extract task_type from payload
+                if let Some(task_type_val) = map.get("task_type").and_then(|v| v.as_str()) {
+                    requirements.required_task_types.insert(task_type_val.to_string());
+                }
+
+                // Extract from affinity rules in payload
+                if let Some(affinity_val) = map.get("affinity").and_then(|v| v.as_str()) {
+                    for part in affinity_val.split(',') {
+                        let part = part.trim();
+                        if let Some((key, value)) = part.split_once('=') {
+                            if key.trim() == "class" {
+                                requirements.required_task_types.insert(value.trim().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Extract from metadata
+        if let Some(metadata) = &task.metadata {
+            // From task_type in metadata
+            if let Some(task_type_val) = metadata.get("task_type") {
+                requirements.required_task_types.insert(task_type_val.to_string());
+            }
+
+            // From affinity in metadata
+            if let Some(affinity_val) = metadata.get("affinity") {
+                for part in affinity_val.split(',') {
+                    let part = part.trim();
+                    if let Some((key, value)) = part.split_once('=') {
+                        if key.trim() == "class" {
+                            requirements.required_task_types.insert(value.trim().to_string());
+                        }
+                    }
                 }
             }
         }
@@ -129,29 +162,47 @@ impl CapacityMatcher {
         }
 
         suitable_nodes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        debug!("Found {} suitable nodes for task requirements", suitable_nodes.len());
         Ok(suitable_nodes)
     }
 
     fn can_node_satisfy_requirements(&self, node_info: &NodeInfo, requirements: &TaskRequirements) -> bool {
         let caps = &node_info.capabilities;
 
+        // Check basic resource requirements
         if caps.cpu_cores < requirements.min_cpu_cores as u32 {
+            debug!("Node {} insufficient CPU cores: {} < {}",
+                node_info.id, caps.cpu_cores, requirements.min_cpu_cores);
             return false;
         }
 
         if caps.memory_mb < requirements.min_memory_mb {
+            debug!("Node {} insufficient memory: {} < {}",
+                node_info.id, caps.memory_mb, requirements.min_memory_mb);
             return false;
         }
 
         if caps.storage_mb < requirements.min_disk_mb {
+            debug!("Node {} insufficient storage: {} < {}",
+                node_info.id, caps.storage_mb, requirements.min_disk_mb);
             return false;
         }
 
+        // Check GPU requirement
+        if requirements.needs_gpu && !caps.supported_task_types.contains(&"gpu".to_string()) {
+            debug!("Node {} lacks GPU support", node_info.id);
+            return false;
+        }
+
+        // Check required task types
         if !requirements.required_task_types.is_empty() {
             let has_required_type = requirements.required_task_types.iter().any(|req_type| {
                 caps.supported_task_types.contains(req_type)
             });
             if !has_required_type {
+                debug!("Node {} lacks required task types: {:?}",
+                    node_info.id, requirements.required_task_types);
                 return false;
             }
         }
@@ -242,6 +293,9 @@ pub enum DistributionError {
 
     #[error("Task state tracking error: {0}")]
     StateTrackingError(String),
+
+    #[error("Node not found: {0}")]
+    NodeNotFound(Uuid),
 }
 
 #[derive(Debug)]
@@ -253,15 +307,28 @@ pub struct ExecutionDecisionLogic {
 }
 
 impl ExecutionDecisionLogic {
-    pub fn new(node_manager: Arc<NodeManager>) -> Self {
-        let local_node_id = if let Some(local_node) = node_manager.registry().local_node() {
-            local_node.id
-        } else {
-            // This should only happen in standalone mode
-            Uuid::nil()
-        };
-
+    pub fn new(node_manager: Arc<NodeManager>, local_node_id: Option<Uuid>) -> Self {
         let capacity_matcher = CapacityMatcher::new(node_manager.clone());
+
+        // Use provided local node ID or try to find it
+        let local_node_id = local_node_id.unwrap_or_else(|| {
+            if let Some(local_node) = node_manager.registry().local_node() {
+                info!("📌 Found local node: {}", local_node.id);
+                local_node.id
+            } else {
+                // Fallback: get it from the first node if available
+                let all_nodes = node_manager.registry().get_all_nodes();
+                if !all_nodes.is_empty() {
+                    warn!("⚠️ No local node found. Using first node: {}", all_nodes[0].id);
+                    all_nodes[0].id
+                } else {
+                    error!("⚠️ No nodes found, using nil UUID");
+                    Uuid::nil()
+                }
+            }
+        });
+
+        info!("Initialized ExecutionDecisionLogic with local node: {}", local_node_id);
 
         Self {
             node_manager,
@@ -277,21 +344,20 @@ impl ExecutionDecisionLogic {
         suitable_nodes: &[(Uuid, f64)]
     ) -> Result<AssignmentDecision> {
         if suitable_nodes.is_empty() {
+            warn!("No suitable nodes found for task requirements");
             return Ok(AssignmentDecision::NoSuitableNode {
                 reason: "No nodes satisfy task requirements".to_string()
             });
         }
 
-        if self.should_force_local(requirements) {
-            return Ok(AssignmentDecision::LocalExecution {
-                node_id: self.local_node_id
-            });
-        }
+        debug!("Deciding execution location among {} suitable nodes", suitable_nodes.len());
 
+        // Find local node score
         let local_score = suitable_nodes.iter()
             .find(|(id, _)| *id == self.local_node_id)
             .map(|(_, score)| *score);
 
+        // Find best remote node
         let best_remote = suitable_nodes.iter()
             .filter(|(id, _)| *id != self.local_node_id)
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
@@ -299,23 +365,34 @@ impl ExecutionDecisionLogic {
 
         match (local_score, best_remote) {
             (Some(local_score), Some((remote_id, remote_score))) => {
+                debug!("Local score: {}, Remote score: {} (threshold: {})",
+                    local_score, remote_score, self.decision_threshold);
+
                 if remote_score > local_score * self.decision_threshold {
+                    info!("Choosing remote node {} over local (score: {} > {} * {})",
+                        remote_id, remote_score, local_score, self.decision_threshold);
                     self.calculate_remote_decision(remote_id, remote_score, requirements).await
                 } else {
+                    info!("Choosing local node {} (score: {} <= {} * {})",
+                        self.local_node_id, remote_score, local_score, self.decision_threshold);
                     Ok(AssignmentDecision::LocalExecution {
                         node_id: self.local_node_id
                     })
                 }
             }
             (Some(_), None) => {
+                info!("No remote nodes available, using local node {}", self.local_node_id);
                 Ok(AssignmentDecision::LocalExecution {
                     node_id: self.local_node_id
                 })
             }
             (None, Some((remote_id, remote_score))) => {
+                info!("Local node not suitable, using remote node {} (score: {})",
+                    remote_id, remote_score);
                 self.calculate_remote_decision(remote_id, remote_score, requirements).await
             }
             _ => {
+                warn!("No suitable nodes found (internal error)");
                 Ok(AssignmentDecision::NoSuitableNode {
                     reason: "Internal error in decision logic".to_string()
                 })
@@ -323,14 +400,10 @@ impl ExecutionDecisionLogic {
         }
     }
 
-    fn should_force_local(&self, _requirements: &TaskRequirements) -> bool {
-        false
-    }
-
     async fn calculate_remote_decision(
         &self,
         remote_node_id: Uuid,
-        _remote_score: f64,
+        remote_score: f64,
         requirements: &TaskRequirements
     ) -> Result<AssignmentDecision> {
         let registry = self.node_manager.registry();
@@ -338,6 +411,9 @@ impl ExecutionDecisionLogic {
         if let Some(node_info) = registry.get(&remote_node_id) {
             let estimated_latency = self.estimate_network_latency(&node_info).await;
             let cost = self.calculate_execution_cost(&node_info, requirements).await;
+
+            info!("Remote execution to node {}: latency={}ms, cost={}, score={}",
+                remote_node_id, estimated_latency, cost, remote_score);
 
             Ok(AssignmentDecision::RemoteExecution {
                 node_id: remote_node_id,
@@ -353,11 +429,11 @@ impl ExecutionDecisionLogic {
         let classification = self.node_manager.classifier().classify(node_info);
 
         match classification {
-            crate::node::NodeClassification::Local => 0.0,
-            crate::node::NodeClassification::Remote => 10.0,
-            crate::node::NodeClassification::Edge => 50.0,
-            crate::node::NodeClassification::Cloud => 100.0,
-            crate::node::NodeClassification::Unknown => 500.0,
+            NodeClassification::Local => 0.0,
+            NodeClassification::Remote => 10.0,
+            NodeClassification::Edge => 50.0,
+            NodeClassification::Cloud => 100.0,
+            NodeClassification::Unknown => 500.0,
         }
     }
 
@@ -369,11 +445,11 @@ impl ExecutionDecisionLogic {
         let classification = self.node_manager.classifier().classify(node_info);
 
         let base_cost = match classification {
-            crate::node::NodeClassification::Local => 1.0,
-            crate::node::NodeClassification::Remote => 1.2,
-            crate::node::NodeClassification::Edge => 1.5,
-            crate::node::NodeClassification::Cloud => 2.0,
-            crate::node::NodeClassification::Unknown => 5.0,
+            NodeClassification::Local => 1.0,
+            NodeClassification::Remote => 1.2,
+            NodeClassification::Edge => 1.5,
+            NodeClassification::Cloud => 2.0,
+            NodeClassification::Unknown => 5.0,
         };
 
         let resource_cost = requirements.min_cpu_cores as f64 * 0.1 +
@@ -381,6 +457,14 @@ impl ExecutionDecisionLogic {
             requirements.estimated_duration_secs * 0.01;
 
         base_cost + resource_cost
+    }
+
+    pub fn set_decision_threshold(&mut self, threshold: f64) {
+        self.decision_threshold = threshold.max(1.0);
+    }
+
+    pub fn get_local_node_id(&self) -> Uuid {
+        self.local_node_id
     }
 }
 
@@ -414,35 +498,65 @@ impl AffinityRuleEngine {
     }
 
     pub fn parse_rules_from_str(&mut self, rules_str: &str) -> Result<()> {
+        // Strip outer quotes if the entire string is quoted
+        let rules_str = rules_str.trim();
+        let rules_str = if (rules_str.starts_with('"') && rules_str.ends_with('"')) ||
+            (rules_str.starts_with('\'') && rules_str.ends_with('\'')) {
+            &rules_str[1..rules_str.len()-1]
+        } else {
+            rules_str
+        };
+
         for part in rules_str.split(',') {
             let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+
             if let Some((key, value)) = part.split_once('=') {
-                match key.trim() {
+                let key = key.trim();
+                let value = value.trim();
+
+                // Strip quotes from both key and value
+                let key = key.trim_matches('"').trim_matches('\'');
+                let value = value.trim_matches('"').trim_matches('\'');
+
+                match key {
                     "node_id" => {
-                        if let Ok(uuid) = Uuid::parse_str(value.trim()) {
+                        if let Ok(uuid) = Uuid::parse_str(value) {
                             self.rules.push(AffinityRule::NodeId(uuid));
                         }
                     }
                     "class" => {
-                        self.rules.push(AffinityRule::NodeClass(value.trim().to_string()));
+                        self.rules.push(AffinityRule::NodeClass(value.to_string()));
                     }
                     "zone" => {
-                        self.rules.push(AffinityRule::Zone(value.trim().to_string()));
+                        self.rules.push(AffinityRule::Zone(value.to_string()));
                     }
                     "region" => {
-                        self.rules.push(AffinityRule::Region(value.trim().to_string()));
+                        self.rules.push(AffinityRule::Region(value.to_string()));
                     }
                     "max_latency" => {
-                        if let Ok(latency) = value.trim().parse() {
+                        if let Ok(latency) = value.parse() {
                             self.rules.push(AffinityRule::MaxLatency(latency));
                         }
                     }
                     "min_health" => {
-                        if let Ok(score) = value.trim().parse() {
+                        if let Ok(score) = value.parse() {
                             self.rules.push(AffinityRule::MinHealthScore(score));
                         }
                     }
-                    _ => {}
+                    "anti_affinity" => {
+                        let nodes: Vec<Uuid> = value.split(';')
+                            .filter_map(|s| Uuid::parse_str(s.trim()).ok())
+                            .collect();
+                        if !nodes.is_empty() {
+                            self.rules.push(AffinityRule::AntiAffinity(nodes));
+                        }
+                    }
+                    _ => {
+                        warn!("Unknown affinity rule key: {}", key);
+                    }
                 }
             }
         }
@@ -452,6 +566,7 @@ impl AffinityRuleEngine {
     pub fn apply_rules(&self, node_id: &Uuid, node_info: &NodeInfo, health_score: Option<f64>) -> bool {
         for rule in &self.rules {
             if !self.check_rule(rule, node_id, node_info, health_score) {
+                debug!("Node {} failed rule: {:?}", node_id, rule);
                 return false;
             }
         }
@@ -485,14 +600,13 @@ impl AffinityRuleEngine {
                 }
             }
             AffinityRule::MaxLatency(max_ms) => {
-                let classifier = crate::node::Classifier::new(Uuid::new_v4());
-                let classification = classifier.classify(node_info);
+                let classification = self.classify_node(node_info);
                 let estimated_latency = match classification {
-                    crate::node::NodeClassification::Local => 0,
-                    crate::node::NodeClassification::Remote => 10,
-                    crate::node::NodeClassification::Edge => 50,
-                    crate::node::NodeClassification::Cloud => 100,
-                    crate::node::NodeClassification::Unknown => 500,
+                    NodeClassification::Local => 0,
+                    NodeClassification::Remote => 10,
+                    NodeClassification::Edge => 50,
+                    NodeClassification::Cloud => 100,
+                    NodeClassification::Unknown => 500,
                 };
                 estimated_latency <= *max_ms
             }
@@ -502,6 +616,24 @@ impl AffinityRuleEngine {
             AffinityRule::AntiAffinity(avoid_nodes) => {
                 !avoid_nodes.contains(node_id)
             }
+        }
+    }
+
+    fn classify_node(&self, node_info: &NodeInfo) -> NodeClassification {
+        // Simple classification based on hostname or metadata
+        if node_info.hostname.contains("local") || node_info.hostname.contains("localhost") {
+            NodeClassification::Local
+        } else if node_info.hostname.contains("edge") {
+            NodeClassification::Edge
+        } else if node_info.hostname.contains("cloud") ||
+            node_info.hostname.contains("aws") ||
+            node_info.hostname.contains("gcp") ||
+            node_info.hostname.contains("azure") {
+            NodeClassification::Cloud
+        } else if node_info.address.ip().is_loopback() {
+            NodeClassification::Local
+        } else {
+            NodeClassification::Remote
         }
     }
 }
@@ -544,7 +676,6 @@ pub struct TaskResult {
     pub completed_at: SystemTime,
 }
 
-// Add Debug implementation for DistributedTaskTracker
 #[derive(Debug)]
 pub struct DistributedTaskTracker {
     remote_tasks: Arc<RwLock<HashMap<Uuid, RemoteTaskState>>>,
@@ -552,11 +683,9 @@ pub struct DistributedTaskTracker {
     task_callbacks: Arc<Mutex<HashMap<Uuid, Vec<Callback>>>>,
 }
 
-// Helper struct to make Debug implementation possible
 #[derive(Clone)]
 struct Callback(Arc<dyn Fn(&RemoteTaskState) + Send + Sync>);
 
-// Implement Debug for Callback to make DistributedTaskTracker Debug
 impl std::fmt::Debug for Callback {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Callback")
@@ -587,6 +716,7 @@ impl DistributedTaskTracker {
         };
 
         self.remote_tasks.write().await.insert(task_id, state);
+        info!("Tracking new task {} on node {}", task_id, node_id);
     }
 
     pub async fn update_task_status(
@@ -599,7 +729,7 @@ impl DistributedTaskTracker {
         let mut tasks = self.remote_tasks.write().await;
 
         if let Some(state) = tasks.get_mut(&task_id) {
-            state.status = status.clone(); // Clone the status enum
+            state.status = status.clone();
             state.progress = progress;
             state.last_heartbeat = SystemTime::now();
 
@@ -616,6 +746,7 @@ impl DistributedTaskTracker {
             }
 
             self.notify_callbacks(task_id, state).await;
+            info!("Task {} status updated: {:?} (progress: {})", task_id, state.status, progress);
             Ok(())
         } else {
             Err(anyhow!("Task {} not found in tracker", task_id))
@@ -623,7 +754,7 @@ impl DistributedTaskTracker {
     }
 
     pub async fn store_task_result(&self, task_id: Uuid, result: TaskResult) {
-        self.task_results.write().await.insert(task_id, result);
+        self.task_results.write().await.insert(task_id, result.clone());
 
         if let Some(state) = self.remote_tasks.write().await.get_mut(&task_id) {
             state.status = RemoteTaskStatus::Completed;
@@ -631,6 +762,8 @@ impl DistributedTaskTracker {
             state.end_time = Some(SystemTime::now());
             self.notify_callbacks(task_id, state).await;
         }
+
+        info!("Stored result for task {} from node {}", task_id, result.node_id);
     }
 
     pub async fn get_task_state(&self, task_id: Uuid) -> Option<RemoteTaskState> {
@@ -663,10 +796,15 @@ impl DistributedTaskTracker {
         let mut tasks = self.remote_tasks.write().await;
         let mut results = self.task_results.write().await;
 
-        tasks.retain(|_, state| {
+        let mut cleaned = 0;
+
+        tasks.retain(|_id, state| {
             if let Some(end_time) = state.end_time {
                 if let Ok(age) = now.duration_since(end_time) {
-                    return age < max_age;
+                    if age > max_age {
+                        cleaned += 1;
+                        return false;
+                    }
                 }
             }
             true
@@ -674,10 +812,17 @@ impl DistributedTaskTracker {
 
         results.retain(|_, result| {
             if let Ok(age) = now.duration_since(result.completed_at) {
-                return age < max_age;
+                if age > max_age {
+                    cleaned += 1;
+                    return false;
+                }
             }
             true
         });
+
+        if cleaned > 0 {
+            info!("Cleaned up {} old task entries", cleaned);
+        }
     }
 
     pub async fn get_all_remote_tasks(&self) -> Vec<RemoteTaskState> {
@@ -770,16 +915,16 @@ impl SerializedTask {
         Task {
             id: self.task_id,
             name: self.name.clone(),
-            task_type: crate::engine::task::TaskType::OneShot,
+            task_type: TaskType::OneShot,
             scheduled_at: SystemTime::now(),
             payload,
-            status: crate::engine::task::TaskStatus::Pending,
+            status: TaskStatus::Pending,
             created_at: SystemTime::now(),
             updated_at: SystemTime::now(),
             retry_count: 0,
             max_retries: 3,
             metadata: Some(self.metadata.clone()),
-            distribution: crate::engine::task::DistributionMetadata::default(),
+            distribution: DistributionMetadata::default(),
         }
     }
 }
@@ -819,18 +964,12 @@ impl SimpleTcpTransport {
         let registry = self.node_manager.registry();
         registry.get(&node_id).map(|node| node.address)
     }
-
-    // Helper method to get a default socket address when parsing fails
-    fn get_default_address() -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080)
-    }
 }
 
 #[async_trait]
 impl NodeTransport for SimpleTcpTransport {
     async fn send_message(&self, node_id: Uuid, message: NodeMessage) -> Result<()> {
-        // Simplified implementation - in real system, you'd use TCP/WebSocket
-        println!("[TRANSPORT] Sending message to node {}: {:?}", node_id, message);
+        debug!("[TRANSPORT] Sending message to node {}: {:?}", node_id, message);
         Ok(())
     }
 
@@ -838,7 +977,7 @@ impl NodeTransport for SimpleTcpTransport {
         let registry = self.node_manager.registry();
         let nodes = registry.get_all_nodes();
 
-        for node in nodes {
+        for node in &nodes {
             if let Some(ref filter) = filter {
                 if let Some(health_score) = self.node_manager.health_scorer().get_score(&node.id) {
                     if let Some(min_score) = filter.min_health_score {
@@ -860,11 +999,11 @@ impl NodeTransport for SimpleTcpTransport {
             let _ = self.send_message(node.id, message.clone()).await;
         }
 
+        info!("[TRANSPORT] Broadcast message to {} nodes", nodes.len());
         Ok(())
     }
 
     async fn receive_messages(&self) -> Result<Vec<(Uuid, NodeMessage)>> {
-        // Simplified - in real system, you'd listen on a socket
         Ok(Vec::new())
     }
 
@@ -872,14 +1011,14 @@ impl NodeTransport for SimpleTcpTransport {
         let mut connections = self.connections.write().await;
         let addr = node_info.address;
         connections.insert(node_info.id, addr);
-        println!("[TRANSPORT] Connected to node {} at {}", node_info.id, addr);
+        info!("[TRANSPORT] Connected to node {} at {}", node_info.id, addr);
         Ok(())
     }
 
     async fn disconnect_node(&self, node_id: Uuid) -> Result<()> {
         let mut connections = self.connections.write().await;
         connections.remove(&node_id);
-        println!("[TRANSPORT] Disconnected from node {}", node_id);
+        info!("[TRANSPORT] Disconnected from node {}", node_id);
         Ok(())
     }
 }
@@ -893,23 +1032,20 @@ pub struct NodeAwareDistributor {
     node_manager: Arc<NodeManager>,
     capacity_matcher: CapacityMatcher,
     decision_logic: ExecutionDecisionLogic,
-    affinity_engine: AffinityRuleEngine,
     task_tracker: Arc<DistributedTaskTracker>,
     transport: Arc<dyn NodeTransport>,
 }
 
 impl NodeAwareDistributor {
-    pub fn new(node_manager: Arc<NodeManager>) -> Result<Self, DistributionError> {
+    pub fn new(node_manager: Arc<NodeManager>, local_node_id: Option<Uuid>) -> Result<Self, DistributionError> {
         let capacity_matcher = CapacityMatcher::new(node_manager.clone());
-        let decision_logic = ExecutionDecisionLogic::new(node_manager.clone());
-        let affinity_engine = AffinityRuleEngine::new();
+        let decision_logic = ExecutionDecisionLogic::new(node_manager.clone(), local_node_id);
         let task_tracker = Arc::new(DistributedTaskTracker::new());
         let transport = Arc::new(SimpleTcpTransport::new(node_manager.clone()));
 
         Ok(Self {
             capacity_matcher,
             decision_logic,
-            affinity_engine,
             task_tracker,
             transport,
             node_manager,
@@ -917,9 +1053,13 @@ impl NodeAwareDistributor {
     }
 
     pub async fn assign_task(&self, task: &Task) -> Result<AssignmentDecision, DistributionError> {
+        info!("Assigning task {}: {}", task.id, task.name);
+
         let requirements = TaskRequirements::from_task(task);
         let affinity_rules = self.parse_affinity_rules_from_task(task);
         let min_health_score = self.extract_min_health_score(task);
+
+        debug!("Task requirements: {:?}", requirements);
 
         let suitable_nodes = self.capacity_matcher.find_suitable_nodes(&requirements, min_health_score)
             .await
@@ -928,14 +1068,49 @@ impl NodeAwareDistributor {
         let filtered_nodes = self.apply_affinity_rules(&affinity_rules, &suitable_nodes).await?;
 
         if filtered_nodes.is_empty() {
+            warn!("No nodes satisfy affinity rules for task {}", task.id);
             return Ok(AssignmentDecision::NoSuitableNode {
                 reason: "No nodes satisfy affinity rules".to_string()
             });
         }
 
-        self.decision_logic.decide_execution_location(&requirements, &filtered_nodes)
+        debug!("Filtered nodes: {:?}", filtered_nodes);
+
+        let decision = self.decision_logic.decide_execution_location(&requirements, &filtered_nodes)
             .await
-            .map_err(|e| DistributionError::NoSuitableNodes(e.to_string()))
+            .map_err(|e| DistributionError::NoSuitableNodes(e.to_string()))?;
+
+        match &decision {
+            AssignmentDecision::LocalExecution { node_id } => {
+                info!("Task {} assigned to local node {}", task.id, node_id);
+            }
+            AssignmentDecision::RemoteExecution { node_id, estimated_latency, cost } => {
+                info!("Task {} assigned to remote node {} (latency: {}ms, cost: {})",
+                    task.id, node_id, estimated_latency, cost);
+            }
+            AssignmentDecision::NoSuitableNode { reason } => {
+                warn!("No suitable node found for task {}: {}", task.id, reason);
+            }
+        }
+
+        Ok(decision)
+    }
+
+    pub async fn execute_task(&self, task: &Task) -> Result<Uuid, DistributionError> {
+        let decision = self.assign_task(task).await?;
+
+        match decision {
+            AssignmentDecision::LocalExecution { node_id } => {
+                info!("Executing task {} locally on node {}", task.id, node_id);
+                Ok(task.id)
+            }
+            AssignmentDecision::RemoteExecution { node_id, .. } => {
+                self.execute_remote_task(task, node_id).await
+            }
+            AssignmentDecision::NoSuitableNode { reason } => {
+                Err(DistributionError::NoSuitableNodes(reason))
+            }
+        }
     }
 
     pub async fn execute_remote_task(&self, task: &Task, node_id: Uuid) -> Result<Uuid, DistributionError> {
@@ -960,25 +1135,17 @@ impl NodeAwareDistributor {
             .await
             .map_err(|e| DistributionError::CommunicationError(e.to_string()))?;
 
-        println!("[DISTRIBUTOR] Task {} assigned to remote node {}", task.id, node_id);
+        info!("[DISTRIBUTOR] Task {} assigned to remote node {}", task.id, node_id);
         Ok(task.id)
     }
 
     pub async fn handle_status_update(&self, node_id: Uuid, message: NodeMessage) -> Result<()> {
         if let NodeMessage::TaskStatusUpdate { task_id, status, progress, error, .. } = message {
-            let status_clone = match status {
-                RemoteTaskStatus::Pending => RemoteTaskStatus::Pending,
-                RemoteTaskStatus::Running => RemoteTaskStatus::Running,
-                RemoteTaskStatus::Completed => RemoteTaskStatus::Completed,
-                RemoteTaskStatus::Failed(ref err) => RemoteTaskStatus::Failed(err.clone()),
-                RemoteTaskStatus::Cancelled => RemoteTaskStatus::Cancelled,
-                RemoteTaskStatus::Timeout => RemoteTaskStatus::Timeout,
-            };
-
-            self.task_tracker.update_task_status(task_id, status_clone, progress, error).await
+            self.task_tracker.update_task_status(task_id, status, progress, error).await
                 .map_err(|e| DistributionError::StateTrackingError(e.to_string()))?;
 
-            println!("[DISTRIBUTOR] Status update for task {} from node {}: {:?}", task_id, node_id, status);
+            info!("[DISTRIBUTOR] Status update for task {} from node {}: progress {}",
+                task_id, node_id, progress);
         }
 
         Ok(())
@@ -996,7 +1163,7 @@ impl NodeAwareDistributor {
             };
 
             self.task_tracker.store_task_result(task_id, result).await;
-            println!("[DISTRIBUTOR] Received result for task {} from node {}", task_id, node_id);
+            info!("[DISTRIBUTOR] Received result for task {} from node {}", task_id, node_id);
         }
 
         Ok(())
@@ -1011,10 +1178,20 @@ impl NodeAwareDistributor {
             }
         }
 
+        // Also check payload for affinity rules
+        if let Some(payload) = &task.payload {
+            if let serde_json::Value::Object(map) = payload {
+                if let Some(affinity_val) = map.get("affinity").and_then(|v| v.as_str()) {
+                    let _ = engine.parse_rules_from_str(affinity_val);
+                }
+            }
+        }
+
         engine
     }
 
     fn extract_min_health_score(&self, task: &Task) -> f64 {
+        // Check metadata
         if let Some(metadata) = &task.metadata {
             if let Some(min_health_str) = metadata.get("min_health_score") {
                 if let Ok(score) = min_health_str.parse::<f64>() {
@@ -1022,7 +1199,17 @@ impl NodeAwareDistributor {
                 }
             }
         }
-        70.0
+
+        // Check payload
+        if let Some(payload) = &task.payload {
+            if let serde_json::Value::Object(map) = payload {
+                if let Some(min_health_val) = map.get("min_health_score").and_then(|v| v.as_f64()) {
+                    return min_health_val.max(0.0).min(100.0);
+                }
+            }
+        }
+
+        50.0 // Lower default minimum health score for development
     }
 
     async fn apply_affinity_rules(
@@ -1054,7 +1241,7 @@ impl NodeAwareDistributor {
 
         DistributionStats {
             total_nodes: nodes.len(),
-            local_node_id: self.decision_logic.local_node_id,
+            local_node_id: self.decision_logic.get_local_node_id(),
             decision_threshold: self.decision_logic.decision_threshold,
             scoring_weights: self.capacity_matcher.scoring_weights.clone(),
         }
@@ -1074,14 +1261,18 @@ impl NodeAwareDistributor {
 
     pub async fn monitor_remote_tasks(&self) {
         let remote_tasks = self.task_tracker.get_running_remote_tasks().await;
+
         for task in remote_tasks {
             let now = SystemTime::now();
             if let Ok(duration) = now.duration_since(task.last_heartbeat) {
                 if duration > Duration::from_secs(30) {
-                    println!("[MONITOR] Task {} on node {} appears stalled", task.task_id, task.node_id);
+                    warn!("[MONITOR] Task {} on node {} appears stalled", task.task_id, task.node_id);
                 }
             }
         }
+
+        // Cleanup old tasks
+        self.task_tracker.cleanup_old_tasks(Duration::from_secs(3600)).await;
     }
 }
 
@@ -1093,65 +1284,115 @@ pub struct DistributionStats {
     pub scoring_weights: ScoringWeights,
 }
 
-// Resource requirements for distribution
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceRequirements {
-    pub min_cpu_cores: f32,
-    pub min_memory_mb: u64,
-    pub min_disk_mb: u64,
-    pub needs_gpu: bool,
-    pub needs_ssd: bool,
-    pub estimated_duration_secs: f64,
-    pub required_task_types: Vec<String>,
-}
-
-impl Default for ResourceRequirements {
-    fn default() -> Self {
-        Self {
-            min_cpu_cores: 0.1,
-            min_memory_mb: 50,
-            min_disk_mb: 10,
-            needs_gpu: false,
-            needs_ssd: false,
-            estimated_duration_secs: 5.0,
-            required_task_types: vec![],
-        }
-    }
-}
-
 // Factory for creating distributed tasks
 #[derive(Debug)]
 pub struct DistributedTaskFactory;
 
 impl DistributedTaskFactory {
-    pub fn gpu_task(name: &str, cpu_cores: f32, memory_mb: u64) -> crate::engine::task::Task {
-        use std::time::Duration;
-
-        crate::engine::task::Task::new_one_shot(name, Duration::from_secs(0), None)
-            .with_basic_resources(cpu_cores, memory_mb, true)
-            .with_affinity_rules("class=gpu").unwrap_or_else(|_| {
-            crate::engine::task::Task::new_one_shot(name, Duration::from_secs(0), None)
-        })
-            .with_min_health_score(80.0)
+    pub fn gpu_task(name: &str, cpu_cores: f32, memory_mb: u64) -> Task {
+        let task = Task {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            task_type: TaskType::OneShot,
+            scheduled_at: SystemTime::now(),
+            payload: Some(serde_json::json!({
+                "cpu_cores": cpu_cores,
+                "memory_mb": memory_mb,
+                "needs_gpu": true,
+                "affinity": "class=gpu",  // FIXED: Use affinity instead of task_type
+                "min_health_score": 50.0  // Lowered for development
+            })),
+            status: TaskStatus::Pending,
+            created_at: SystemTime::now(),
+            updated_at: SystemTime::now(),
+            retry_count: 0,
+            max_retries: 3,
+            metadata: Some(HashMap::from([
+                ("affinity".to_string(), "class=gpu".to_string()),  // FIXED
+                ("min_health_score".to_string(), "50.0".to_string()),
+            ])),
+            distribution: DistributionMetadata::default(),
+        };
+        task
     }
 
-    pub fn memory_intensive_task(name: &str, cpu_cores: f32, memory_mb: u64) -> crate::engine::task::Task {
-        use std::time::Duration;
-
-        crate::engine::task::Task::new_one_shot(name, Duration::from_secs(0), None)
-            .with_basic_resources(cpu_cores, memory_mb, false)
-            .with_affinity_rules("class=high-memory").unwrap_or_else(|_| {
-            crate::engine::task::Task::new_one_shot(name, Duration::from_secs(0), None)
-        })
-            .with_min_health_score(70.0)
+    pub fn memory_intensive_task(name: &str, cpu_cores: f32, memory_mb: u64) -> Task {
+        let mut task = Task {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            task_type: TaskType::OneShot,
+            scheduled_at: SystemTime::now(),
+            payload: Some(serde_json::json!({
+                "cpu_cores": cpu_cores,
+                "memory_mb": memory_mb,
+                "needs_gpu": false,
+                "affinity": "class=high-memory",
+                "min_health_score": 50.0  // Lowered for development
+            })),
+            status: TaskStatus::Pending,
+            created_at: SystemTime::now(),
+            updated_at: SystemTime::now(),
+            retry_count: 0,
+            max_retries: 3,
+            metadata: Some(HashMap::from([
+                ("affinity".to_string(), "class=high-memory".to_string()),
+                ("min_health_score".to_string(), "50.0".to_string()),
+            ])),
+            distribution: DistributionMetadata::default(),
+        };
+        task
     }
 
-    pub fn low_latency_task(name: &str) -> crate::engine::task::Task {
-        use std::time::Duration;
+    pub fn low_latency_task(name: &str) -> Task {
+        let mut task = Task {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            task_type: TaskType::OneShot,
+            scheduled_at: SystemTime::now(),
+            payload: Some(serde_json::json!({
+                "force_local": true,
+                "max_latency": 10,
+                "min_health_score": 50.0  // Lowered for development
+            })),
+            status: TaskStatus::Pending,
+            created_at: SystemTime::now(),
+            updated_at: SystemTime::now(),
+            retry_count: 0,
+            max_retries: 3,
+            metadata: Some(HashMap::from([
+                ("force_local".to_string(), "true".to_string()),
+                ("max_latency".to_string(), "10".to_string()),
+                ("min_health_score".to_string(), "50.0".to_string()),
+            ])),
+            distribution: DistributionMetadata::default(),
+        };
+        task
+    }
 
-        crate::engine::task::Task::new_one_shot(name, Duration::from_secs(0), None)
-            .force_local()
-            .with_max_latency(10)
-            .with_min_health_score(90.0)
+    pub fn cpu_intensive_task(name: &str, cpu_cores: f32, memory_mb: u64) -> Task {
+        let mut task = Task {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            task_type: TaskType::OneShot,
+            scheduled_at: SystemTime::now(),
+            payload: Some(serde_json::json!({
+                "cpu_cores": cpu_cores,
+                "memory_mb": memory_mb,
+                "needs_gpu": false,
+                "affinity": "class=cpu-intensive",
+                "min_health_score": 50.0
+            })),
+            status: TaskStatus::Pending,
+            created_at: SystemTime::now(),
+            updated_at: SystemTime::now(),
+            retry_count: 0,
+            max_retries: 3,
+            metadata: Some(HashMap::from([
+                ("affinity".to_string(), "class=cpu-intensive".to_string()),
+                ("min_health_score".to_string(), "50.0".to_string()),
+            ])),
+            distribution: DistributionMetadata::default(),
+        };
+        task
     }
 }

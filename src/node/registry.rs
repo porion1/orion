@@ -4,6 +4,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
+use anyhow::Result;
 
 /// Node information stored in the registry
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +50,7 @@ pub struct NodeCapabilities {
     pub supported_task_types: Vec<String>,
 }
 
+// Update the Default implementation
 impl Default for NodeCapabilities {
     fn default() -> Self {
         Self {
@@ -56,7 +58,16 @@ impl Default for NodeCapabilities {
             memory_mb: 8192,
             storage_mb: 102400,
             max_concurrent_tasks: 10,
-            supported_task_types: vec!["default".to_string()],
+            supported_task_types: vec![
+                "default".to_string(),
+                "gpu".to_string(),           // Add these
+                "high-memory".to_string(),   // Add these
+                "memory-intensive".to_string(), // Add these
+                "cpu-intensive".to_string(), // Add these
+                "low-latency".to_string(),   // Add these
+                "general".to_string(),
+                "io-intensive".to_string(),// Add these
+            ],
         }
     }
 }
@@ -215,6 +226,22 @@ impl NodeRegistry {
             }
         }
 
+        Ok(())
+    }
+
+    /// Update node capabilities with anyhow::Result return type
+    pub fn update_node_capabilities(
+        &self,
+        node_id: &Uuid,
+        new_capabilities: NodeCapabilities
+    ) -> Result<(), anyhow::Error> {
+        use anyhow::Context;
+
+        // Update the capabilities
+        self.update_capabilities(node_id, new_capabilities)
+            .map_err(|e| anyhow::anyhow!("Failed to update node capabilities: {}", e))?;
+
+        println!("✅ Updated capabilities for node {}", node_id);
         Ok(())
     }
 

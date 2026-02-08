@@ -10,13 +10,12 @@
 //!
 //! ## Quick Start
 //! ```
-//! use orion::{Engine, EngineConfig, Task};
+//! use orion::prelude::*;
 //! use std::time::Duration;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
-//!     let config = EngineConfig::defaults();
-//!     let engine = orion::Engine::new(config);
+//!     let engine = orion::Engine::default();
 //!
 //!     // Create a task
 //!     let task = Task::new_one_shot("my_task", Duration::from_secs(5), None);
@@ -38,6 +37,10 @@ pub mod security;
 pub mod utils;
 pub mod metrics;
 pub mod node;
+pub mod routing;
+
+/// Current version of the Orion scheduler
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Re-export commonly used types
 pub use engine::{
@@ -55,6 +58,13 @@ pub use node::{
     MembershipManager, NodeClassification
 };
 
+// Re-export routing types
+pub use routing::{
+    Router, RouterConfig, RoutingStrategy, RoundRobinStrategy,
+    LeastLoadedStrategy, LatencyAwareStrategy, FailoverStrategy,
+    HybridStrategy, TaskAdapter, TaskRouterIntegrator
+};
+
 // Optional: Create a prelude module for common imports
 pub mod prelude {
     pub use crate::{
@@ -64,6 +74,11 @@ pub mod prelude {
         TaskExecutor,
     };
     pub use crate::engine::task::{TaskType, TaskStatus};
+    pub use crate::routing::{
+        Router, RouterConfig, RoutingStrategy,
+        RoundRobinStrategy, LeastLoadedStrategy,
+        LatencyAwareStrategy, FailoverStrategy, HybridStrategy
+    };
 
     // Re-export common dependencies if desired
     pub use uuid::Uuid;
@@ -74,14 +89,14 @@ pub mod prelude {
 impl Engine {
     /// Create a new engine with default configuration
     pub fn default() -> Self {
-        Self::new(EngineConfig::defaults())  // Use defaults() not default()
+        Self::new(EngineConfig::default())
     }
 }
 
 // Optional: Provide a quick start function
 /// Creates and starts a new engine with default settings
 pub async fn start_engine() -> anyhow::Result<Arc<Engine>> {
-    let engine = Arc::new(Engine::default());
+    let engine = Arc::new(Engine::new(EngineConfig::default()));
     let engine_clone = Arc::clone(&engine);
 
     tokio::spawn(async move {

@@ -128,6 +128,9 @@ enum Command {
         #[arg(long)]
         force_distribute: bool,
     },
+
+    /// NEW: Fix node capabilities
+    FixCapabilities,
 }
 
 // Helper function to schedule tasks with distribution
@@ -219,9 +222,11 @@ async fn process_command(cmd: &str, engine: Arc<Engine>) {
             println!("  task-status <task_id>       - Get detailed task status");
             println!("  force-node <task_id> <node> - Force task to specific node");
             println!("  test-distribute <name>      - Test distribution features");
+            println!("  fix-capabilities            - Fix node capabilities (add task types)");
             println!("  quit / exit                 - Shutdown the engine");
         }
         "schedule" => {
+            // ... existing schedule command code ...
             if parts.len() < 2 {
                 println!("Usage: schedule <name> [options]");
                 println!("Use 'help' to see all options");
@@ -366,6 +371,7 @@ async fn process_command(cmd: &str, engine: Arc<Engine>) {
             }
         }
         "list" => {
+            // ... existing list command code ...
             let tasks = engine.get_pending_tasks().await;
             println!("📋 Pending tasks ({}):", tasks.len());
             for task in tasks {
@@ -421,6 +427,7 @@ async fn process_command(cmd: &str, engine: Arc<Engine>) {
             }
         }
         "cancel" => {
+            // ... existing cancel command code ...
             if parts.len() < 2 {
                 println!("Usage: cancel <task_id>");
                 return;
@@ -440,6 +447,7 @@ async fn process_command(cmd: &str, engine: Arc<Engine>) {
             }
         }
         "stats" => {
+            // ... existing stats command code ...
             let pending = engine.get_pending_tasks().await.len();
             let completed = engine.executor.get_completed_count().await;
             let active = engine.executor.get_active_count().await;
@@ -501,12 +509,14 @@ async fn process_command(cmd: &str, engine: Arc<Engine>) {
             }
         }
         "demo" => {
+            // ... existing demo command code ...
             println!("🎬 Running demo tasks...");
             if let Err(e) = run_demo_tasks(engine.clone()).await {
                 eprintln!("❌ Demo failed: {}", e);
             }
         }
         "dist-demo" | "distribution-demo" => {
+            // ... existing dist-demo command code ...
             println!("🌐 Running distribution demo...");
             if !engine.is_distribution_enabled() {
                 println!("⚠️ Distribution is not enabled. Enable cluster mode in config.");
@@ -519,6 +529,7 @@ async fn process_command(cmd: &str, engine: Arc<Engine>) {
             }
         }
         "cluster" => {
+            // ... existing cluster command code ...
             if !engine.is_distribution_enabled() {
                 println!("⚠️ Cluster mode is not enabled.");
                 println!("   Set cluster.enabled = true in config.yaml");
@@ -551,6 +562,7 @@ async fn process_command(cmd: &str, engine: Arc<Engine>) {
             }
         }
         "nodes" => {
+            // ... existing nodes command code ...
             if !engine.is_distribution_enabled() {
                 println!("⚠️ Cluster mode is not enabled.");
                 return;
@@ -574,6 +586,8 @@ async fn process_command(cmd: &str, engine: Arc<Engine>) {
                              node.capabilities.cpu_cores,
                              node.capabilities.memory_mb,
                              node.capabilities.storage_mb);
+                    // ADD THIS LINE:
+                    println!("     Task Types: {:?}", node.capabilities.supported_task_types);
                     println!("     Max tasks: {}, Version: {}",
                              node.capabilities.max_concurrent_tasks,
                              node.version);
@@ -587,6 +601,7 @@ async fn process_command(cmd: &str, engine: Arc<Engine>) {
             }
         }
         "remote-tasks" => { // NEW: Remote tasks command
+            // ... existing remote-tasks command code ...
             if !engine.is_distribution_enabled() {
                 println!("⚠️ Distribution is not enabled. Enable cluster mode in config.");
                 return;
@@ -634,6 +649,7 @@ async fn process_command(cmd: &str, engine: Arc<Engine>) {
             }
         }
         "task-status" => { // NEW: Task status command
+            // ... existing task-status command code ...
             if parts.len() < 2 {
                 println!("Usage: task-status <task_id>");
                 return;
@@ -689,6 +705,7 @@ async fn process_command(cmd: &str, engine: Arc<Engine>) {
             }
         }
         "force-node" => { // NEW: Force task to specific node
+            // ... existing force-node command code ...
             if parts.len() < 3 {
                 println!("Usage: force-node <task_id> <node_id>");
                 return;
@@ -723,6 +740,7 @@ async fn process_command(cmd: &str, engine: Arc<Engine>) {
             }
         }
         "test-distribute" => { // NEW: Test distribution
+            // ... existing test-distribute command code ...
             if parts.len() < 2 {
                 println!("Usage: test-distribute <name> [--node-id <uuid>] [--force-distribute]");
                 return;
@@ -784,6 +802,87 @@ async fn process_command(cmd: &str, engine: Arc<Engine>) {
                 }
             }
         }
+        "fix-capabilities" => {
+            // NEW: Fix capabilities command - simplified version
+            if !engine.is_distribution_enabled() {
+                println!("⚠️ Distribution is not enabled.");
+                return;
+            }
+
+            println!("🔧 Node Capabilities Diagnostic Tool");
+            println!("{}", "=".repeat(40));
+
+            if let Some(node_manager) = &engine.node_manager {
+                let registry = node_manager.registry();
+                let all_nodes = registry.get_all_nodes();
+
+                println!("Found {} nodes in the cluster:", all_nodes.len());
+                println!();
+
+                let standard_types = vec![
+                    "default", "gpu", "high-memory", "memory-intensive",
+                    "cpu-intensive", "low-latency", "general"
+                ];
+
+                let mut nodes_needing_update = Vec::new();
+                let mut success_count = 0;
+                let mut error_count = 0;
+
+                // Iterate over reference to avoid moving
+                for node in &all_nodes {
+                    println!("Node {}", node.id);
+                    println!("  Hostname: {}", node.hostname);
+                    println!("  Current task types: {:?}", node.capabilities.supported_task_types);
+
+                    // Check which standard types are missing
+                    let missing_types: Vec<_> = standard_types
+                        .iter()
+                        .filter(|&&t| !node.capabilities.supported_task_types.contains(&t.to_string()))
+                        .collect();
+
+                    if !missing_types.is_empty() {
+                        println!("  ⚠️  Missing types: {:?}", missing_types);
+                        nodes_needing_update.push(node.id);
+                        error_count += 1;
+                    } else {
+                        println!("  ✅ Has all standard types");
+                        success_count += 1;
+                    }
+                    println!();
+                }
+
+                println!("\n📊 Summary:");
+                println!("   Nodes with proper capabilities: {}", success_count);
+                println!("   Nodes needing updates: {}", error_count);
+                println!("   Total nodes processed: {}", all_nodes.len());
+
+                if !nodes_needing_update.is_empty() {
+                    println!("\n💡 {} nodes need capability updates:", nodes_needing_update.len());
+                    for node_id in nodes_needing_update {
+                        println!("   - Node {}", node_id);
+                    }
+
+                    println!("\n📝 To update capabilities:");
+                    println!("   1. Restart nodes with updated config.yaml");
+                    println!("   2. Add these to supported_task_types:");
+                    println!("        - default");
+                    println!("        - gpu");
+                    println!("        - high-memory");
+                    println!("        - memory-intensive");
+                    println!("        - cpu-intensive");
+                    println!("        - low-latency");
+                    println!("        - general");
+
+                    if error_count > 0 {
+                        println!("\n💡 Note: Some nodes may need manual configuration restart");
+                    }
+                } else {
+                    println!("🎯 All nodes have proper capabilities!");
+                }
+            } else {
+                println!("⚠️ Node Manager not available");
+            }
+        }
         _ => {
             println!("❌ Unknown command. Type 'help' for available commands.");
         }
@@ -791,6 +890,7 @@ async fn process_command(cmd: &str, engine: Arc<Engine>) {
 }
 
 async fn run_demo_tasks(engine: Arc<Engine>) -> Result<()> {
+    // ... existing run_demo_tasks function code ...
     println!("📋 Scheduling demo tasks...");
 
     // Helper function
@@ -920,6 +1020,7 @@ async fn run_demo_tasks(engine: Arc<Engine>) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // ... existing main function code ...
     // Parse CLI arguments
     let args = Args::parse();
     let config_path = &args.config;
@@ -1157,12 +1258,52 @@ async fn main() -> Result<()> {
                 println!("💡 Use 'list' and 'remote-tasks' to see the results");
                 return Ok(());
             }
+            Command::FixCapabilities => { // NEW: Handle fix-capabilities command
+                if !engine.is_distribution_enabled() {
+                    println!("⚠️ Distribution is not enabled.");
+                    return Ok(());
+                }
+
+                if let Some(node_manager) = &engine.node_manager {
+                    let registry = node_manager.registry();
+                    let all_nodes = registry.get_all_nodes();
+
+                    println!("🔧 Updating capabilities for {} nodes...", all_nodes.len());
+
+                    for node in all_nodes {
+                        let new_capabilities = orion::node::registry::NodeCapabilities {
+                            cpu_cores: node.capabilities.cpu_cores,
+                            memory_mb: node.capabilities.memory_mb,
+                            storage_mb: node.capabilities.storage_mb,
+                            max_concurrent_tasks: node.capabilities.max_concurrent_tasks,
+                            supported_task_types: vec![
+                                "default".to_string(),
+                                "gpu".to_string(),
+                                "high-memory".to_string(),
+                                "memory-intensive".to_string(),
+                                "cpu-intensive".to_string(),
+                                "low-latency".to_string(),
+                                "general".to_string(),
+                            ],
+                        };
+
+                        // Note: You need to implement update_node_capabilities in NodeRegistry
+                        println!("⚠️ Note: update_node_capabilities method needs to be implemented in NodeRegistry");
+                        println!("💡 Would update capabilities for node {} with task types: {:?}",
+                                 node.id, new_capabilities.supported_task_types);
+                    }
+                    println!("🎯 All nodes capabilities would be updated successfully!");
+                } else {
+                    println!("⚠️ Node Manager not available");
+                }
+                return Ok(());
+            }
         }
     }
 
     // If no command, start the engine in interactive mode
     println!("\n🎯 Starting Orion Engine in interactive mode");
-    println!("💡 Commands: schedule, list, cancel, stats, demo, dist-demo, cluster, nodes, remote-tasks, task-status, force-node, test-distribute, quit");
+    println!("💡 Commands: schedule, list, cancel, stats, demo, dist-demo, cluster, nodes, remote-tasks, task-status, force-node, test-distribute, fix-capabilities, quit");
     println!("{}", "=".repeat(50));
 
     // Start the engine in background
