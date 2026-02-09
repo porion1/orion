@@ -1,14 +1,14 @@
 scheduler_tick_secs: 1
 max_concurrent_tasks: 100
 logging_level: "debug"
-persistence_path: "./orion-data"
-metrics_port: 9000
+persistence_path: "./orion-data-node2"
+metrics_port: 9001
 metrics_enabled: true
 
 node:
-  name: "node-1"
+  name: "node-2"
   hostname: "localhost"
-  listen_addr: "0.0.0.0:8080"
+  listen_addr: "0.0.0.0:8081"  # CHANGED: 8082 → 8081 (unique port)
   capabilities:
     cpu_cores: 4
     memory_mb: 8192
@@ -24,22 +24,21 @@ node:
       - general
       - io-intensive
 
-# MUST BE cluster_config: (not cluster:) to match others
 cluster_config:
   enabled: true
-  cluster_name: "orion-cluster"
-  node_id: "550e8400-e29b-41d4-a716-446655440000"
-  node_name: "node-1"
+  cluster_name: "orion-cluster"  # MUST match all nodes
+  node_id: "11111111-2222-3333-4444-555555555555"
+  node_name: "node-2"
   hostname: "localhost"
-  node_listen_addr: "0.0.0.0:9090"
-  advertise_addr: "127.0.0.1:9090"  # CHANGE: localhost → 127.0.0.1
+  node_listen_addr: "0.0.0.0:9091"
+  advertise_addr: "127.0.0.1:9091"
   heartbeat_interval_ms: 5000
   failure_timeout_secs: 30
-  cluster_peers: ["127.0.0.1:9091", "127.0.0.1:9092"]  # ADD: Node 2 & 3
-  node_persistence_path: "./orion-nodes"
+  cluster_peers: ["127.0.0.1:9090", "127.0.0.1:9092"]  # ADDED Node 3
+  node_persistence_path: "./orion-nodes-node2"
   min_health_score: 70.0
   auto_discovery: true
-  discovery_type: "static"  # CHANGE: local → static
+  discovery_type: "static"  # MUST be "static" (not "local")
   capabilities:
     cpu_cores: 4
     memory_mb: 8192

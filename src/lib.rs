@@ -38,6 +38,7 @@ pub mod utils;
 pub mod metrics;
 pub mod node;
 pub mod routing;
+pub mod scoring;
 
 /// Current version of the Orion scheduler
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -1,11 +1,11 @@
 scheduler_tick_secs: 1
 max_concurrent_tasks: 100
-logging_level: "info"
+logging_level: "debug"
 persistence_path: "./orion-data"
 metrics_port: 9000
 metrics_enabled: true
 
-# Node configuration (MOVED from cluster section)
+# Node configuration - REQUIRED!
 node:
   name: "node-1"
   hostname: "localhost"
@@ -25,17 +25,21 @@ node:
       - general
       - io-intensive
 
-# Cluster configuration
+# Cluster configuration - FIXED SECTION NAME!
 cluster:
   enabled: true
   cluster_name: "orion-cluster"
-  node_listen_addr: "0.0.0.0:9090"  # Different port for cluster communication
+  node_listen_addr: "0.0.0.0:9090"
+  advertise_addr: "localhost:9090"
   cluster_peers: []
   heartbeat_interval_ms: 5000
   failure_timeout_ms: 30000
+  min_health_score: 70.0
+  node_persistence_path: "./orion-nodes"
+  auto_discovery: true
   discovery_type: "local"
 
-# Routing configuration
+# Routing configuration - REQUIRED!
 routing:
   enabled: true
   default_strategy: "least_loaded"

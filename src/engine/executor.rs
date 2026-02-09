@@ -43,6 +43,40 @@ impl TaskExecutor {
         }
     }
 
+    /// NEW: Execute task on specific node
+    pub async fn execute_task_on_node(&self, task: QueueTask, node_id: Uuid) {
+        println!("🎯 Executing task {} on specific node {}", task.id, node_id);
+
+        // TODO: Implement actual node-specific execution
+        // For now, just call the generic execute_task
+        // In the future, this should route the task to the specific node
+
+        // You could add node_id to task metadata
+        let mut task_with_node = task.clone();
+        if let Some(payload) = &mut task_with_node.payload {
+            // Check if payload is an Object (JSON object/map)
+            if let serde_json::Value::Object(ref mut map) = payload {
+                // It's already an object, insert into it
+                map.insert("target_node".to_string(), serde_json::Value::String(node_id.to_string()));
+            } else {
+                // It's not an object (could be array, string, number, etc.)
+                // Create a new object with the existing value and target_node
+                let mut map = serde_json::Map::new();
+                // Optionally keep the existing value under a different key
+                map.insert("original_payload".to_string(), payload.clone());
+                map.insert("target_node".to_string(), serde_json::Value::String(node_id.to_string()));
+                *payload = serde_json::Value::Object(map);
+            }
+        } else {
+            // No payload exists, create a new object
+            let mut map = serde_json::Map::new();
+            map.insert("target_node".to_string(), serde_json::Value::String(node_id.to_string()));
+            task_with_node.payload = Some(serde_json::Value::Object(map));
+        }
+
+        self.execute_task(task_with_node).await;
+    }
+
     /// Worker pool loop
     pub async fn start(self: Arc<Self>) {
         println!("👷 Executor started with {} max concurrent tasks", self.semaphore.available_permits());

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::net::SocketAddr;
@@ -41,6 +42,20 @@ pub struct ClusterConfig {
 
     #[serde(default = "default_auto_discovery")]
     pub auto_discovery: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ScoringConfig {
+    pub mode: String, // "static" or "adaptive"
+    pub weights: HashMap<String, f64>,
+    pub adaptive: Option<AdaptiveConfig>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AdaptiveConfig {
+    pub learning_rate: f64,
+    pub history_size: usize,
+    pub min_data_points: usize,
 }
 
 impl Default for ClusterConfig {

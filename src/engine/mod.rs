@@ -5,6 +5,7 @@ pub mod task;
 pub mod queue;
 pub mod executor;
 pub mod distribution;
+pub mod node;
 
 // Import routing module from crate root
 pub use crate::routing;
@@ -80,10 +81,25 @@ impl Engine {
             Duration::from_secs(5),
         ));
 
-        // Scheduler
+        // CREATE SCORER AND NODE REGISTRY FOR SCHEDULER
+        use crate::scoring::StaticScorer;
+        let scorer = Box::new(StaticScorer::new(HashMap::new()));
+
+        // Create node registry (even if empty for now)
+        let node_registry = Arc::new(
+            crate::node::registry::NodeRegistry::new(None)
+                .unwrap_or_else(|_| {
+                    println!("⚠️ Failed to create node registry, using empty registry");
+                    crate::node::registry::NodeRegistry::new(None).expect("Fallback node registry creation failed")
+                })
+        );
+
+        // Scheduler with scoring capability
         let scheduler = Arc::new(Scheduler::new(
+            scorer,
             Arc::clone(&task_queue),
             Arc::clone(&executor),
+            node_registry,
         ));
 
         // Initialize components based on configuration
@@ -1092,24 +1108,29 @@ pub async fn run_distribution_demo(engine: Arc<Engine>) -> Result<()> {
 
     // Create and schedule demo tasks
     let tasks = vec![
-        ("GPU-intensive task", DistributedTaskFactory::gpu_task("GPU Training Demo", 4.0, 8192)),
-        ("Memory-intensive task", DistributedTaskFactory::memory_intensive_task("Memory Analytics Demo", 2.0, 16384)),
-        ("Low-latency task", DistributedTaskFactory::low_latency_task("Low-Latency Processing")),
+        ("GPU-intensive task", crate::engine::task::DistributedTaskFactory::gpu_task("GPU Training Demo", 4.0, 8192)),
+        ("Memory-intensive task", crate::engine::task::DistributedTaskFactory::memory_intensive_task("Memory Analytics Demo", 2.0, 16384)),
+        ("Low-latency task", Ok(crate::engine::task::DistributedTaskFactory::low_latency_task("Low-Latency Processing"))),
     ];
 
     for (task_type, task) in tasks {
         println!("\n📝 Scheduling {}...", task_type);
-        let queue_task = create_distributed_task(
-            task.clone(),
-            TaskPriority::High,
-            None
-        );
+        match task {
+            Ok(task) => {
+                let queue_task = create_distributed_task(
+                    task.clone(),
+                    TaskPriority::High,
+                    None
+                );
 
-        match engine.schedule_task(queue_task.clone()).await {
-            Ok(id) => {
-                println!("✅ Task scheduled: '{}' [{}]", task.name, id);
+                match engine.schedule_task(queue_task.clone()).await {
+                    Ok(id) => {
+                        println!("✅ Task scheduled: '{}' [{}]", task.name, id);
+                    }
+                    Err(e) => println!("⚠️ Failed to schedule task '{}': {}", task.name, e),
+                }
             }
-            Err(e) => println!("⚠️ Failed to schedule task '{}': {}", task.name, e),
+            Err(e) => println!("⚠️ Failed to create task for {}: {}", task_type, e),
         }
     }
 

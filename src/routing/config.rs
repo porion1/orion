@@ -1,7 +1,7 @@
 //! Configuration for routing and load balancing
 
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+//use std::time::Duration;
 
 /// Router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]

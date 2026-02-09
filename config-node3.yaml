@@ -1,50 +1,46 @@
 scheduler_tick_secs: 1
 max_concurrent_tasks: 100
 logging_level: "debug"
-persistence_path: "./orion-data"
-metrics_port: 9000
+persistence_path: "./orion-data-node3"
+metrics_port: 9002
 metrics_enabled: true
 
 node:
-  name: "node-1"
+  name: "node-3"
   hostname: "localhost"
-  listen_addr: "0.0.0.0:8080"
+  listen_addr: "0.0.0.0:8083"  # CHANGE: 8082 → 8083 (avoid conflict!)
   capabilities:
-    cpu_cores: 4
-    memory_mb: 8192
-    storage_mb: 102400
-    max_concurrent_tasks: 50
+    cpu_cores: 2
+    memory_mb: 4096
+    storage_mb: 51200
+    max_concurrent_tasks: 30
     supported_task_types:
       - default
-      - gpu
-      - high-memory
-      - memory-intensive
       - cpu-intensive
       - low-latency
       - general
-      - io-intensive
 
-# MUST BE cluster_config: (not cluster:) to match others
+# MUST BE cluster_config: (not cluster:)
 cluster_config:
   enabled: true
-  cluster_name: "orion-cluster"
-  node_id: "550e8400-e29b-41d4-a716-446655440000"
-  node_name: "node-1"
+  cluster_name: "orion-cluster"  # MUST match others
+  node_id: "22222222-3333-4444-5555-666666666666"  # NEW UUID
+  node_name: "node-3"
   hostname: "localhost"
-  node_listen_addr: "0.0.0.0:9090"
-  advertise_addr: "127.0.0.1:9090"  # CHANGE: localhost → 127.0.0.1
+  node_listen_addr: "0.0.0.0:9092"
+  advertise_addr: "127.0.0.1:9092"  # ADD this!
   heartbeat_interval_ms: 5000
   failure_timeout_secs: 30
-  cluster_peers: ["127.0.0.1:9091", "127.0.0.1:9092"]  # ADD: Node 2 & 3
-  node_persistence_path: "./orion-nodes"
+  cluster_peers: ["127.0.0.1:9090", "127.0.0.1:9091"]  # Connect to both nodes
+  node_persistence_path: "./orion-nodes-node3"
   min_health_score: 70.0
   auto_discovery: true
-  discovery_type: "static"  # CHANGE: local → static
+  discovery_type: "static"  # MUST match others
   capabilities:
-    cpu_cores: 4
-    memory_mb: 8192
-    max_concurrent_tasks: 50
-    supported_task_types: ["cpu_intensive", "memory_intensive", "io_intensive"]
+    cpu_cores: 2
+    memory_mb: 4096
+    max_concurrent_tasks: 30
+    supported_task_types: ["cpu_intensive", "low_latency", "general"]
 
 routing:
   enabled: true

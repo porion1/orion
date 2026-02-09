@@ -965,7 +965,7 @@ impl From<Task> for QueueTask {
 
 /// --------------------------------
 /// Helper functions for creating distributed tasks
-/// --------------------------------
+/// ----------------from_queue_task----------------
 
 /// Create a distributed one-shot task
 pub fn create_distributed_one_shot(
